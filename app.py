@@ -39,6 +39,7 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 APP_ACCESS_KEY = os.environ.get("APP_ACCESS_KEY", "")
+ASSET_VERSION = "3"
 
 _analysis_lock = threading.Lock()
 _sec_lock = threading.Lock()
@@ -59,7 +60,7 @@ RELATION_TERMS = (
     "subsidiar", "affiliate", "joint venture", "partnership", "partner",
     "operat", "office", "facility", "research and development", "r&d",
     "contract", "customer", "supplier", "vendor", "acquisition", "acquired",
-    "investment", "invested", "agreement", "distribution", "manufactur",
+    "investment", "invested", "agreement", "distribution", "distribut", "manufactur",
     "employee", "employees", "sales", "revenue", "branch", "incorporat",
     "factory", "fab", "plant", "campus", "headquarter", "hire", "procurement",
 )
@@ -73,6 +74,18 @@ CURATED_COMPANY_SOURCES = {
             "source_class": "Fonte aziendale ufficiale",
         },
     ],
+}
+FERRERO_ISRAEL_SOURCE = [{
+    "title": "Ferrero in Israel",
+    "url": "https://www.ferrero.com/il/en/about-us/ferrero-in-israel",
+    "source_class": "Fonte aziendale ufficiale",
+}]
+CURATED_COMPANY_SOURCES_BY_NAME = {
+    name: FERRERO_ISRAEL_SOURCE
+    for name in {
+        "ferrero", "ferrero group", "ferrero international",
+        "ferrero international s a", "ferrero s p a",
+    }
 }
 STOP_WORDS = set("""
 the and for with from that this were was are has have had its into their they
@@ -433,10 +446,15 @@ def _source_date(value: str) -> str:
     return str(value or "")[:10]
 
 
-def _curated_company_evidence(cik: str) -> tuple[list[dict], list[dict], str]:
+def _curated_company_evidence(
+    cik: str, company: str = ""
+) -> tuple[list[dict], list[dict], str]:
     documents: list[dict] = []
     evidence: list[dict] = []
-    sources = CURATED_COMPANY_SOURCES.get(cik, [])
+    sources = list(CURATED_COMPANY_SOURCES.get(cik, []))
+    company_key = _normalize_company(company)
+    sources.extend(CURATED_COMPANY_SOURCES_BY_NAME.get(company_key, []))
+    sources = list({source["url"]: source for source in sources}.values())
     if not sources:
         return documents, evidence, "non configurata per questa società"
     for source in sources:
@@ -729,9 +747,13 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
     gc.collect()
 
     if cik:
-        profile_documents, profile_evidence, profile_status = _curated_company_evidence(cik)
+        profile_documents, profile_evidence, profile_status = _curated_company_evidence(
+            cik, company_name
+        )
     else:
-        profile_documents, profile_evidence, profile_status = [], [], "non applicabile: nessun CIK SEC"
+        profile_documents, profile_evidence, profile_status = _curated_company_evidence(
+            "", company_name
+        )
     news_documents, news_evidence, news_status = _gdelt_public_sources(company_name)
     evidence.extend(profile_evidence)
     evidence.extend(news_evidence)
@@ -866,7 +888,13 @@ def security_headers(response):
 
 @app.get("/")
 def index():
-    return render_template("index.html", access_key_required=bool(APP_ACCESS_KEY))
+    response = app.make_response(render_template(
+        "index.html",
+        access_key_required=bool(APP_ACCESS_KEY),
+        asset_version=ASSET_VERSION,
+    ))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/healthz")

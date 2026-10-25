@@ -3,6 +3,7 @@ services:
     name: traccia
     runtime: python
     plan: free
+    autoDeployTrigger: commit
     buildCommand: pip install -r requirements.txt && python -m spacy download en_core_web_sm && python scripts/download_models.py
     startCommand: gunicorn --workers 1 --threads 2 --timeout 120 --access-logfile - --error-logfile - app:app
     healthCheckPath: /healthz
