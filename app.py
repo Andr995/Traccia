@@ -138,19 +138,21 @@ def find_companies(query: str) -> list[dict]:
     query_norm = _normalize_company(query)
     if len(query_norm) < 2:
         return []
+    query_tokens = query_norm.split()
+    query_ticker = re.sub(r"[^A-Z0-9]", "", query.upper())
     payload = json.loads(_fetch(SEC_TICKERS_URL, max_bytes=8_000_000))
     matches = []
     for row in payload.values():
         title = row.get("title", "")
         normalized = _normalize_company(title)
+        title_tokens = normalized.split()
+        ticker = re.sub(r"[^A-Z0-9]", "", str(row.get("ticker", "")).upper())
         if query_norm == normalized:
             score = 100
-        elif normalized.startswith(query_norm):
+        elif query_ticker and query_ticker == ticker:
+            score = 95
+        elif query_tokens and all(part in title_tokens for part in query_tokens):
             score = 80
-        elif query_norm in normalized:
-            score = 60
-        elif all(part in normalized.split() for part in query_norm.split()):
-            score = 45
         else:
             continue
         matches.append({

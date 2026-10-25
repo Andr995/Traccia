@@ -28,6 +28,17 @@
     $("#search-button").classList.toggle("is-loading", value);
   }
 
+  async function readApiResponse(response) {
+    const body = await response.text();
+    let payload = null;
+    try { payload = body ? JSON.parse(body) : null; } catch {}
+    if (!payload || typeof payload !== "object") {
+      throw new Error(`Il servizio ha restituito una risposta vuota o non leggibile (HTTP ${response.status}). Controlla i log Render.`);
+    }
+    if (!response.ok) throw new Error(payload.error || `Richiesta non riuscita (HTTP ${response.status}).`);
+    return payload;
+  }
+
   function renderCompanies(results) {
     const container = $("#company-results");
     container.replaceChildren();
@@ -73,8 +84,7 @@
     $("#company-results").replaceChildren();
     try {
       const response = await fetch(`/api/companies?q=${encodeURIComponent(query)}`, { headers: apiHeaders() });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Ricerca non disponibile.");
+      const payload = await readApiResponse(response);
       renderCompanies(payload.results || []);
       $("#search-status").textContent = payload.results?.length ? "Controlla nome e ticker prima di continuare." : "Nessuna corrispondenza nel catalogo SEC. Prova la ragione sociale ufficiale.";
     } catch (error) {
@@ -141,8 +151,7 @@
         headers: apiHeaders(true),
         body: JSON.stringify({ company: state.selected.name, cik: state.selected.cik }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Analisi non disponibile.");
+      const payload = await readApiResponse(response);
       renderReport(payload);
     } catch (error) {
       $("#error-message").textContent = error.message;
