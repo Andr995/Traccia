@@ -2,7 +2,7 @@
   const $ = (selector) => document.querySelector(selector);
   const state = { selected: null, lastQuery: "", result: null, busy: false };
   const keyRequired = document.body.dataset.accessKeyRequired === "true";
-  const historyKey = "traccia.reports.v1";
+  const historyKey = "traccia.reports.v2";
 
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -39,30 +39,51 @@
     return payload;
   }
 
-  function renderCompanies(results) {
+  function renderCompanies(results, manualName = "") {
     const container = $("#company-results");
     container.replaceChildren();
-    if (!results.length) return;
-    const heading = document.createElement("p");
-    heading.className = "result-count";
-    heading.textContent = `${results.length} corrispondenze · seleziona l’entità corretta`;
-    container.append(heading);
+    if (!results.length && !manualName) return;
+    if (results.length) {
+      const heading = document.createElement("p");
+      heading.className = "result-count";
+      heading.textContent = `${results.length} candidati · verifica nome e descrizione`;
+      container.append(heading);
+    }
     results.forEach((company) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "company-option";
+      const identifier = company.cik
+        ? `${company.ticker || "SEC"} · CIK ${company.cik}`
+        : `Wikidata ${company.entity_id}${company.description ? ` · ${company.description}` : ""}`;
       button.innerHTML = `<span class="option-monogram" aria-hidden="true">${escapeHtml(company.name.slice(0, 1))}</span>
-        <span class="option-info"><strong>${escapeHtml(company.name)}</strong><small>${escapeHtml(company.ticker || "Emittente SEC")} · CIK ${escapeHtml(company.cik)}</small></span>
+        <span class="option-info"><strong>${escapeHtml(company.name)}</strong><small>${escapeHtml(identifier)}</small></span>
         <span class="option-arrow" aria-hidden="true">↗</span>`;
       button.addEventListener("click", () => selectCompany(company));
       container.append(button);
     });
+    if (manualName) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "company-option manual-option";
+      button.innerHTML = `<span class="option-monogram" aria-hidden="true">⌕</span>
+        <span class="option-info"><strong>Analizza il nome inserito</strong><small>${escapeHtml(manualName)} · identità non verificata in SEC/Wikidata</small></span>
+        <span class="option-arrow" aria-hidden="true">↗</span>`;
+      button.addEventListener("click", () => selectCompany({
+        name: manualName, ticker: "", cik: "", entity_id: "", entity_source: "Nome inserito",
+      }));
+      container.append(button);
+    }
   }
 
   function selectCompany(company) {
     state.selected = company;
     $("#selected-name").textContent = company.name;
-    $("#selected-meta").textContent = `${company.ticker || "Emittente SEC"} · CIK ${company.cik}`;
+    $("#selected-meta").textContent = company.cik
+      ? `${company.ticker || "SEC"} · CIK ${company.cik}`
+      : company.entity_id
+        ? `Wikidata ${company.entity_id} · identità da confermare`
+        : "Nome inserito · identità non verificata";
     $("#selected-company").classList.remove("hidden");
     $("#company-results").replaceChildren();
     $("#analyze-button").disabled = state.busy;
@@ -80,13 +101,17 @@
     state.selected = null;
     $("#selected-company").classList.add("hidden");
     $("#analyze-button").disabled = true;
-    $("#search-status").textContent = "Ricerca nel catalogo SEC…";
+    $("#search-status").textContent = "Ricerca nel catalogo SEC e in Wikidata…";
     $("#company-results").replaceChildren();
     try {
       const response = await fetch(`/api/companies?q=${encodeURIComponent(query)}`, { headers: apiHeaders() });
       const payload = await readApiResponse(response);
-      renderCompanies(payload.results || []);
-      $("#search-status").textContent = payload.results?.length ? "Controlla nome e ticker prima di continuare." : "Nessuna corrispondenza nel catalogo SEC. Prova la ragione sociale ufficiale.";
+      renderCompanies(payload.results || [], payload.manual_name || "");
+      $("#search-status").textContent = payload.results?.length
+        ? "Controlla nome e descrizione; poi avvia la ricerca sulle fonti."
+        : payload.manual_name
+          ? "Nessun candidato nei registri: puoi continuare con il nome inserito."
+          : "Nessuna corrispondenza trovata.";
     } catch (error) {
       $("#search-status").textContent = error.message;
     } finally {
@@ -127,7 +152,7 @@
     const entityCount = new Set(evidence.flatMap((item) => item.entities || [])).size;
     const sourceStates = (result.source_status || []).map((source) => `<li><strong>${escapeHtml(source.source)}</strong><span>${escapeHtml(source.status)}</span></li>`).join("");
     $("#report").innerHTML = `<div class="report-topline"><span class="eyebrow">DOSSIER ${escapeHtml(result.report_id)}</span><div class="report-actions"><button id="export-report" class="text-button" type="button">Esporta JSON ↓</button><button id="print-report" class="text-button" type="button">Stampa</button></div></div>
-      <div class="company-title"><div><h2>${escapeHtml(result.company)}</h2><p>${escapeHtml(result.ticker || "Emittente SEC")} <span>·</span> CIK ${escapeHtml(result.cik)}</p></div><span class="scope-chip">${docs.length} fonti</span></div>
+      <div class="company-title"><div><h2>${escapeHtml(result.company)}</h2><p>${result.cik ? `${escapeHtml(result.ticker || "Emittente SEC")} · CIK ${escapeHtml(result.cik)}` : `${escapeHtml(result.identity_source || "Nome inserito")}${result.entity_id ? ` · ${escapeHtml(result.entity_id)}` : " · identità da verificare"}`}</p></div><span class="scope-chip">${docs.length} fonti</span></div>
       <section class="verdict-block ${tone}"><div class="verdict-symbol" aria-hidden="true">${tone === "amber" ? "!" : tone === "green" ? "✓" : "·"}</div><div class="verdict-content"><p class="eyebrow">VERDETTO</p><h1>${escapeHtml(result.verdict)}</h1><p>${escapeHtml(result.explanation)}</p></div></section>
       <section class="confidence-row" aria-label="Indicatore di pertinenza delle evidenze"><div class="confidence-copy"><span class="eyebrow">QUALITÀ DEL RECUPERO</span><strong>${escapeHtml(result.confidence)}<small>/100</small></strong><span class="confidence-label">${confidenceLabel(result.confidence)}</span></div><progress class="confidence-meter" max="100" value="${Math.max(0, Math.min(100, result.confidence))}" aria-label="Punteggio di pertinenza"></progress><p class="confidence-note">${escapeHtml(result.confidence_label)} · Euristica da calibrare, non probabilità di legame.</p></section>
       <section class="reasoning"><p class="eyebrow">LETTURA DEL SISTEMA</p><p>${escapeHtml(result.explanation)}</p><div class="method-tags"><span>${escapeHtml(faissState)}</span><span>Entità NER negli estratti: ${entityCount}</span><span>${result.retrieval?.official_profile ? "Profilo ufficiale consultato" : "Profilo ufficiale non configurato"}</span><span>${result.retrieval?.gdelt_context ? "GDELT consultato" : "GDELT non disponibile"}</span></div></section>
@@ -151,7 +176,7 @@
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: apiHeaders(true),
-        body: JSON.stringify({ company: state.selected.name, cik: state.selected.cik }),
+        body: JSON.stringify({ company: state.selected.name, cik: state.selected.cik || "", entity_id: state.selected.entity_id || "" }),
       });
       const payload = await readApiResponse(response);
       renderReport(payload);

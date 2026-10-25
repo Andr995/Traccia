@@ -1,7 +1,7 @@
-"""Traccia: low-memory public-company evidence research app.
+"""Traccia: low-memory public-source company evidence research app.
 
-The app deliberately reports filing mentions as candidates for analyst review.
-It does not infer that a company has a relationship from a keyword alone.
+The app reports source passages as candidates for analyst review and never infers
+a corporate relationship from a keyword alone.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
 GDELT_CONTEXT_URL = "https://api.gdeltproject.org/api/v2/context/context"
+WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 MAX_FILINGS = min(6, max(1, int(os.environ.get("MAX_FILINGS", "4"))))
 MAX_FILING_BYTES = int(os.environ.get("MAX_FILING_BYTES", str(2 * 1024 * 1024)))
 MAX_CHUNKS = min(1200, max(100, int(os.environ.get("MAX_CHUNKS", "800"))))
@@ -47,6 +48,8 @@ _embedder = None
 _spacy_nlp = None
 _spacy_checked = False
 _request_counts: dict[str, list[float]] = {}
+_wikidata_cache: dict[str, tuple[float, list[dict]]] = {}
+_wikidata_cache_lock = threading.Lock()
 
 ISRAEL_TERMS = (
     "israel", "israeli", "israelis", "tel aviv", "jerusalem", "haifa",
@@ -127,10 +130,17 @@ def _sec_headers() -> dict[str, str]:
 
 
 def _fetch(
-    url: str, *, sec: bool = True, max_bytes: int = 4_000_000, timeout: int = 18
+    url: str,
+    *,
+    sec: bool = True,
+    max_bytes: int = 4_000_000,
+    timeout: int = 18,
+    user_agent: str | None = None,
 ) -> bytes:
     global _last_sec_request
-    headers = _sec_headers() if sec else {"User-Agent": "Traccia/1.0"}
+    headers = _sec_headers() if sec else {
+        "User-Agent": user_agent or "Traccia/1.0 (public company research)",
+    }
     headers["Accept"] = "application/json, text/html, text/plain;q=0.9, */*;q=0.5"
     if sec:
         with _sec_lock:
@@ -179,6 +189,61 @@ def find_companies(query: str) -> list[dict]:
         })
     matches.sort(key=lambda item: (-item["score"], item["name"]))
     return matches[:12]
+
+
+def find_wikidata_entities(query: str) -> list[dict]:
+    """Resolve non-SEC names to human-confirmed Wikidata candidates."""
+    cache_key = _normalize_company(query)
+    now = time.monotonic()
+    with _wikidata_cache_lock:
+        cached = _wikidata_cache.get(cache_key)
+        if cached and now - cached[0] < 3600:
+            return [dict(item) for item in cached[1]]
+
+    params = {
+        "action": "wbsearchentities",
+        "search": query[:100],
+        "language": "en",
+        "format": "json",
+        "formatversion": "2",
+        "type": "item",
+        "limit": "6",
+        "maxlag": "5",
+    }
+    url = f"{WIKIDATA_API_URL}?{urlencode(params)}"
+    try:
+        user_agent = os.environ.get("SEC_USER_AGENT", "Traccia/1.0 (public company research)")
+        payload = json.loads(_fetch(
+            url, sec=False, max_bytes=400_000, timeout=8, user_agent=user_agent
+        ))
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return []
+
+    matches = []
+    rows = payload.get("search", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    for row in rows[:6]:
+        if not isinstance(row, dict):
+            continue
+        entity_id = str(row.get("id", ""))
+        label = str(row.get("label", "")).strip()
+        if not re.fullmatch(r"Q[1-9]\d*", entity_id) or not label:
+            continue
+        matches.append({
+            "name": label,
+            "ticker": "",
+            "cik": "",
+            "entity_id": entity_id,
+            "entity_source": "Wikidata",
+            "description": str(row.get("description", ""))[:220],
+            "score": 60,
+        })
+    with _wikidata_cache_lock:
+        if len(_wikidata_cache) >= 256:
+            _wikidata_cache.clear()
+        _wikidata_cache[cache_key] = (now, [dict(item) for item in matches])
+    return matches
 
 
 def _recent_filings(cik: str) -> tuple[dict, list[dict]]:
@@ -411,6 +476,62 @@ def _company_search_alias(company: str) -> str:
     return " ".join(tokens) or _normalize_company(company)
 
 
+def _gdelt_article_leads(
+    company: str,
+) -> tuple[list[dict], list[dict], str]:
+    """Find up to a few media leads in GDELT's rolling three-month article index."""
+    alias = _company_search_alias(company)
+    query = (
+        f'"{alias}" (Israel OR Israeli OR "Tel Aviv" OR Jerusalem OR Haifa '
+        'OR "Kiryat Gat")'
+    )
+    params = {
+        "query": query,
+        "mode": "artlist",
+        "format": "json",
+        "maxrecords": str(MAX_NEWS_RESULTS),
+        "timespan": "3m",
+    }
+    url = f"https://api.gdeltproject.org/api/v2/doc/doc?{urlencode(params)}"
+    try:
+        payload = json.loads(_fetch(url, sec=False, max_bytes=1_000_000, timeout=8))
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return [], [], "indice articoli non disponibile"
+    if not isinstance(payload, dict) or not isinstance(payload.get("articles", []), list):
+        return [], [], "indice articoli con risposta non valida"
+
+    documents: list[dict] = []
+    headline_evidence: list[dict] = []
+    for article in payload.get("articles", [])[:MAX_NEWS_RESULTS]:
+        if not isinstance(article, dict):
+            continue
+        source_url = str(article.get("url", ""))
+        if not source_url.startswith(("https://", "http://")):
+            continue
+        title = str(article.get("title", ""))[:300]
+        domain = str(article.get("domain", ""))[:160]
+        seen_date = _source_date(article.get("seendate") or "")
+        record = {
+            "form": "Articolo indicizzato",
+            "date": seen_date,
+            "date_kind": "rilevazione GDELT",
+            "description": title or domain or "Articolo trovato tramite GDELT",
+            "source_url": source_url,
+            "source_class": "Fonte giornalistica / GDELT",
+            "domain": domain,
+            "language": str(article.get("language", ""))[:40],
+        }
+        documents.append(record)
+        for mention in _sentence_mentions(title):
+            headline_evidence.append({
+                **mention,
+                **record,
+                "source_class": "Titolo giornalistico / GDELT",
+                "entities": [],
+            })
+    return documents, headline_evidence, f"indice consultato: {len(documents)} titoli / ultimi 3 mesi"
+
+
 def _gdelt_context_evidence(
     company: str,
 ) -> tuple[list[dict], list[dict], str]:
@@ -473,6 +594,21 @@ def _gdelt_context_evidence(
     return documents, evidence, f"consultata: {len(documents)} risultati negli ultimi 3 giorni"
 
 
+def _gdelt_public_sources(company: str) -> tuple[list[dict], list[dict], str]:
+    articles, headlines, article_status = _gdelt_article_leads(company)
+    context, snippets, context_status = _gdelt_context_evidence(company)
+    by_url = {item["source_url"]: item for item in articles}
+    by_url.update({item["source_url"]: item for item in context})
+    seen = set()
+    evidence = []
+    for item in headlines + snippets:
+        key = (item["source_url"], item["text"][:160])
+        if key not in seen:
+            seen.add(key)
+            evidence.append(item)
+    return list(by_url.values()), evidence, f"{article_status}; {context_status}"
+
+
 def _get_spacy():
     global _spacy_nlp, _spacy_checked
     if _spacy_checked:
@@ -514,16 +650,20 @@ def _evidence_score(evidence: list[dict], filing_count: int, model_used: bool) -
                + (4 if model_used else 0) + (5 if primary else 0))
 
 
-def analyze_company(company: str, cik: str) -> dict:
+def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
     global _embedder, _spacy_nlp, _spacy_checked
-    if not re.fullmatch(r"\d{10}", cik):
+    if cik and not re.fullmatch(r"\d{10}", cik):
         raise ValueError("CIK non valido.")
-    sec_status = "consultata"
-    try:
-        metadata, filings = _recent_filings(cik)
-    except (HTTPError, URLError, TimeoutError, ValueError):
+    if cik:
+        sec_status = "consultata"
+        try:
+            metadata, filings = _recent_filings(cik)
+        except (HTTPError, URLError, TimeoutError, ValueError):
+            metadata, filings = {"name": company, "tickers": []}, []
+            sec_status = "non disponibile"
+    else:
         metadata, filings = {"name": company, "tickers": []}, []
-        sec_status = "non disponibile"
+        sec_status = "non applicabile: analisi per nome senza CIK SEC"
     company_name = metadata.get("name") or company
     filing_documents: list[dict] = []
     chunks: list[dict] = []
@@ -588,8 +728,11 @@ def analyze_company(company: str, cik: str) -> dict:
     _spacy_checked = False
     gc.collect()
 
-    profile_documents, profile_evidence, profile_status = _curated_company_evidence(cik)
-    news_documents, news_evidence, news_status = _gdelt_context_evidence(company_name)
+    if cik:
+        profile_documents, profile_evidence, profile_status = _curated_company_evidence(cik)
+    else:
+        profile_documents, profile_evidence, profile_status = [], [], "non applicabile: nessun CIK SEC"
+    news_documents, news_evidence, news_status = _gdelt_public_sources(company_name)
     evidence.extend(profile_evidence)
     evidence.extend(news_evidence)
     evidence.sort(key=lambda item: (item["candidate"], item.get("date", "")), reverse=True)
@@ -634,10 +777,22 @@ def analyze_company(company: str, cik: str) -> dict:
     else:
         verdict = "Analisi incompleta"
         explanation = "Non è stato possibile recuperare fonti analizzabili nel perimetro configurato."
+    if not cik:
+        identity_note = (
+            f" Identità selezionata tramite Wikidata ({entity_id}); verifica che corrisponda "
+            "all’azienda cercata."
+            if entity_id else
+            " Analisi per nome inserito: l’identità societaria non è verificata nei registri."
+        )
+        explanation += identity_note
     score = _evidence_score(evidence, len(filing_documents), vector_used)
+    if not cik:
+        score = min(score, 64)
     return {
         "company": company_name,
         "cik": cik,
+        "entity_id": entity_id,
+        "identity_source": "Wikidata" if entity_id else ("SEC" if cik else "Nome inserito"),
         "ticker": metadata.get("tickers", [""])[0] if metadata.get("tickers") else "",
         "verdict": verdict,
         "explanation": explanation,
@@ -652,14 +807,17 @@ def analyze_company(company: str, cik: str) -> dict:
             "bm25": True,
             "faiss": vector_used,
             "embedding_model": EMBEDDING_MODEL if vector_used else None,
-            "gdelt_context": news_status.startswith("consultata"),
+            "gdelt_context": (
+                "indice consultato:" in news_status or "consultata:" in news_status
+            ),
             "official_profile": profile_status == "consultata",
         },
         "scope": (
-            "Ultimi filing SEC recuperabili (10-K, 20-F, 8-K e 6-K), profili aziendali ufficiali "
-            "presenti nel catalogo verificato e contesto di notizie GDELT degli ultimi 3 giorni "
-            f"(massimo {MAX_NEWS_RESULTS} risultati). L’assenza di risultati non prova l’assenza "
-            "di rapporti; la copertura dei profili ufficiali varia per società."
+            "Quando è disponibile un CIK: ultimi filing SEC recuperabili (10-K, 20-F, 8-K e 6-K) "
+            "e profili ufficiali nel catalogo verificato. Per ogni nome: indici GDELT di articoli "
+            f"degli ultimi 3 mesi e snippet degli ultimi 3 giorni (massimo {MAX_NEWS_RESULTS} ciascuno). "
+            "Wikidata aiuta a identificare candidati, non è un registro completo di tutte le aziende. "
+            "La copertura varia per società e l’assenza di risultati non prova l’assenza di rapporti."
         ),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "report_id": hashlib.sha256(f"{cik}:{time.time_ns()}".encode()).hexdigest()[:12],
@@ -723,14 +881,19 @@ def companies():
     if _rate_limited(30, 60):
         return jsonify({"error": "Troppe ricerche. Attendi un minuto."}), 429
     query = request.args.get("q", "")[:100]
+    if len(query.strip()) < 2:
+        return jsonify({"results": [], "manual_name": ""})
+    sec_results = []
     try:
-        return jsonify({"results": find_companies(query)})
-    except RuntimeError as error:
-        return jsonify({"error": str(error)}), 503
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
-        return jsonify({"error": f"Ricerca SEC non disponibile: {type(error).__name__}."}), 502
-    except ValueError as error:
-        return jsonify({"error": f"Risposta SEC non utilizzabile: {error}"}), 502
+        sec_results = find_companies(query)
+    except (RuntimeError, HTTPError, URLError, TimeoutError, ValueError):
+        # Keep name-based search available when SEC is unavailable or the company
+        # is not a SEC filer; the analyst can choose a Wikidata or manual match.
+        sec_results = []
+    if sec_results:
+        return jsonify({"results": sec_results, "manual_name": ""})
+    entity_results = find_wikidata_entities(query.strip())
+    return jsonify({"results": entity_results, "manual_name": query.strip()})
 
 
 @app.post("/api/analyze")
@@ -742,13 +905,17 @@ def analyze():
         return jsonify({"error": "Limite gratuito: massimo 6 analisi per ora da questo indirizzo."}), 429
     payload = request.get_json(silent=True) or {}
     company = str(payload.get("company", ""))[:160].strip()
-    cik = str(payload.get("cik", ""))[:10].strip().zfill(10)
-    if not company or not re.fullmatch(r"\d{10}", cik):
-        return jsonify({"error": "Seleziona una società SEC prima di avviare l’analisi."}), 400
+    raw_cik = str(payload.get("cik", ""))[:10].strip()
+    cik = raw_cik.zfill(10) if raw_cik.isdigit() and raw_cik else ""
+    entity_id = str(payload.get("entity_id", ""))[:16].strip().upper()
+    if entity_id and not re.fullmatch(r"Q[1-9]\d*", entity_id):
+        entity_id = ""
+    if not company:
+        return jsonify({"error": "Inserisci o seleziona il nome di un’azienda."}), 400
     if not _analysis_lock.acquire(blocking=False):
         return jsonify({"error": "Un’analisi è già in corso. Riprova tra poco."}), 429
     try:
-        result = analyze_company(company, cik)
+        result = analyze_company(company, cik, entity_id)
         return jsonify(result)
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 503

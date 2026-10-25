@@ -87,6 +87,7 @@ input:focus { border-color: var(--blue-strong); box-shadow: 0 0 0 3px color-mix(
 .result-count { margin: 0 0 5px; color: var(--subtle); font: 500 9px 'DM Mono', monospace; letter-spacing: .45px; text-transform: uppercase; }
 .company-option { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px; text-align: left; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--surface); cursor: pointer; }
 .company-option:hover { border-color: var(--blue-strong); background: var(--surface-raised); }
+.company-option.manual-option { border-style: dashed; }
 .option-monogram { width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; color: var(--blue); font: 600 11px 'DM Mono', monospace; }
 .option-info { min-width: 0; flex: 1; }.option-info strong, .option-info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .option-info strong { font-size: 11px; font-weight: 600; }.option-info small { margin-top: 3px; color: var(--muted); font: 10px 'DM Mono', monospace; }
