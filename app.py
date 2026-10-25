@@ -18,7 +18,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, render_template, request
@@ -29,9 +29,11 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
+GDELT_CONTEXT_URL = "https://api.gdeltproject.org/api/v2/context/context"
 MAX_FILINGS = min(6, max(1, int(os.environ.get("MAX_FILINGS", "4"))))
 MAX_FILING_BYTES = int(os.environ.get("MAX_FILING_BYTES", str(2 * 1024 * 1024)))
 MAX_CHUNKS = min(1200, max(100, int(os.environ.get("MAX_CHUNKS", "800"))))
+MAX_NEWS_RESULTS = min(8, max(1, int(os.environ.get("MAX_NEWS_RESULTS", "5"))))
 EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
@@ -56,7 +58,19 @@ RELATION_TERMS = (
     "contract", "customer", "supplier", "vendor", "acquisition", "acquired",
     "investment", "invested", "agreement", "distribution", "manufactur",
     "employee", "employees", "sales", "revenue", "branch", "incorporat",
+    "factory", "fab", "plant", "campus", "headquarter", "hire", "procurement",
 )
+# Curated starting points are primary sources published by the companies themselves.
+# Add entries only after checking the company identifier and the source URL.
+CURATED_COMPANY_SOURCES = {
+    "0000050863": [
+        {
+            "title": "Intel in Israel",
+            "url": "https://www.intel.com/content/www/us/en/corporate-responsibility/intel-in-israel.html",
+            "source_class": "Fonte aziendale ufficiale",
+        },
+    ],
+}
 STOP_WORDS = set("""
 the and for with from that this were was are has have had its into their they
 will would could should about after before under over between across company
@@ -112,7 +126,9 @@ def _sec_headers() -> dict[str, str]:
     return {"User-Agent": agent, "Accept-Encoding": "identity"}
 
 
-def _fetch(url: str, *, sec: bool = True, max_bytes: int = 4_000_000) -> bytes:
+def _fetch(
+    url: str, *, sec: bool = True, max_bytes: int = 4_000_000, timeout: int = 18
+) -> bytes:
     global _last_sec_request
     headers = _sec_headers() if sec else {"User-Agent": "Traccia/1.0"}
     headers["Accept"] = "application/json, text/html, text/plain;q=0.9, */*;q=0.5"
@@ -123,7 +139,7 @@ def _fetch(url: str, *, sec: bool = True, max_bytes: int = 4_000_000) -> bytes:
                 time.sleep(wait)
             _last_sec_request = time.monotonic()
     req = Request(url, headers=headers)
-    with urlopen(req, timeout=18) as response:
+    with urlopen(req, timeout=timeout) as response:
         data = response.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError("Il documento supera il limite di download configurato.")
@@ -166,7 +182,7 @@ def find_companies(query: str) -> list[dict]:
 
 
 def _recent_filings(cik: str) -> tuple[dict, list[dict]]:
-    submissions = json.loads(_fetch(SEC_SUBMISSIONS_URL.format(cik=cik)))
+    submissions = json.loads(_fetch(SEC_SUBMISSIONS_URL.format(cik=cik), timeout=10))
     recent = submissions.get("filings", {}).get("recent", {})
     forms = recent.get("form", [])
     selected = []
@@ -205,7 +221,9 @@ def _filing_url(cik: str, filing: dict) -> str:
 def _html_to_text(data: bytes) -> str:
     parser = FilingText()
     parser.feed(data.decode("utf-8", errors="replace"))
-    text = html.unescape(" ".join(" ".join(parser.parts).split()))
+    raw = html.unescape("".join(parser.parts))
+    lines = [" ".join(line.split()) for line in raw.splitlines()]
+    text = "\n".join(line for line in lines if line)
     return text[:3_000_000]
 
 
@@ -342,6 +360,119 @@ def _sentence_mentions(text: str) -> list[dict]:
     return output
 
 
+def _source_date(value: str) -> str:
+    """Normalize source dates without presenting GDELT's seen date as a publish date."""
+    match = re.match(r"^(\d{4})(\d{2})(\d{2})", str(value or ""))
+    if match:
+        return "-".join(match.groups())
+    return str(value or "")[:10]
+
+
+def _curated_company_evidence(cik: str) -> tuple[list[dict], list[dict], str]:
+    documents: list[dict] = []
+    evidence: list[dict] = []
+    sources = CURATED_COMPANY_SOURCES.get(cik, [])
+    if not sources:
+        return documents, evidence, "non configurata per questa società"
+    for source in sources:
+        record = {
+            "form": "Profilo aziendale",
+            "date": "",
+            "description": source["title"],
+            "source_url": source["url"],
+            "source_class": source["source_class"],
+        }
+        try:
+            raw = _fetch(source["url"], sec=False, max_bytes=1_200_000, timeout=10)
+            text = _html_to_text(raw)
+            documents.append(record)
+            for mention in _sentence_mentions(text):
+                evidence.append({
+                    **mention,
+                    **record,
+                    "entities": [],
+                })
+                if len(evidence) >= 8:
+                    break
+        except (HTTPError, URLError, TimeoutError, ValueError):
+            continue
+    status = "consultata" if documents else "non raggiungibile"
+    return documents, evidence, status
+
+
+def _company_search_alias(company: str) -> str:
+    tokens = _normalize_company(company).split()
+    legal_suffixes = {
+        "inc", "incorporated", "corp", "corporation", "company", "co",
+        "plc", "ltd", "limited", "llc", "llp", "sa", "nv", "ag",
+    }
+    while tokens and tokens[-1] in legal_suffixes:
+        tokens.pop()
+    return " ".join(tokens) or _normalize_company(company)
+
+
+def _gdelt_context_evidence(
+    company: str,
+) -> tuple[list[dict], list[dict], str]:
+    """Retrieve recent sentence-level media context; links remain analyst-review leads."""
+    alias = _company_search_alias(company)
+    if len(alias) < 2:
+        return [], [], "saltata: nome non sufficiente"
+    query = (
+        f'"{alias}" (Israel OR Israeli OR "Tel Aviv" OR Jerusalem OR Haifa '
+        'OR "Kiryat Gat")'
+    )
+    params = {
+        'query': query,
+        'mode': 'artlist',
+        'format': 'json',
+        'maxrecords': str(MAX_NEWS_RESULTS),
+        'timespan': '3d',
+        'sort': 'datedesc',
+    }
+    url = f"{GDELT_CONTEXT_URL}?{urlencode(params)}"
+    try:
+        payload = json.loads(_fetch(url, sec=False, max_bytes=1_000_000, timeout=8))
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return [], [], "non disponibile"
+
+    documents: list[dict] = []
+    evidence: list[dict] = []
+    if not isinstance(payload, dict):
+        return [], [], "risposta non valida"
+    articles = payload.get("articles", [])
+    if not isinstance(articles, list):
+        return [], [], "risposta non valida"
+    for article in articles[:MAX_NEWS_RESULTS]:
+        if not isinstance(article, dict):
+            continue
+        source_url = str(article.get("url", ""))
+        if not source_url.startswith(("https://", "http://")):
+            continue
+        title = str(article.get("title", ""))[:300]
+        domain = str(article.get("domain", ""))[:160]
+        seen_date = _source_date(article.get("seendate") or article.get("seen_at") or "")
+        record = {
+            "form": "Articolo indicizzato",
+            "date": seen_date,
+            "date_kind": "rilevazione GDELT",
+            "description": title or domain or "Articolo trovato tramite GDELT",
+            "source_url": source_url,
+            "source_class": "Fonte giornalistica / GDELT",
+            "domain": domain,
+            "language": str(article.get("language", ""))[:40],
+        }
+        documents.append(record)
+        snippet = str(article.get("context") or article.get("sentence") or title)
+        for mention in _sentence_mentions(snippet):
+            evidence.append({**mention, **record, "entities": []})
+            if len(evidence) >= 12:
+                break
+        if len(evidence) >= 12:
+            break
+    return documents, evidence, f"consultata: {len(documents)} risultati negli ultimi 3 giorni"
+
+
 def _get_spacy():
     global _spacy_nlp, _spacy_checked
     if _spacy_checked:
@@ -371,22 +502,30 @@ def _extract_entities(text: str) -> list[str]:
 
 
 def _evidence_score(evidence: list[dict], filing_count: int, model_used: bool) -> int:
-    """An evidence-quality heuristic, explicitly not a probability of a tie."""
+    """A rough retrieval-quality signal, explicitly not a probability of a tie."""
     if not evidence:
-        return min(68, 30 + filing_count * 7)
+        return min(48, 18 + filing_count * 5)
     explicit = sum(bool(item["relation_terms"]) for item in evidence)
-    distinct_filings = len({item["filing_url"] for item in evidence})
-    return min(88, 38 + min(explicit, 3) * 9 + min(distinct_filings - 1, 2) * 6
-               + (4 if model_used else 0))
+    distinct_sources = len({item.get("source_class", "") for item in evidence})
+    primary = any(item.get("source_class") in {
+        "Fonte aziendale ufficiale", "Filing regolamentare SEC",
+    } for item in evidence)
+    return min(92, 42 + min(explicit, 4) * 6 + min(distinct_sources, 3) * 5
+               + (4 if model_used else 0) + (5 if primary else 0))
 
 
 def analyze_company(company: str, cik: str) -> dict:
     global _embedder, _spacy_nlp, _spacy_checked
     if not re.fullmatch(r"\d{10}", cik):
         raise ValueError("CIK non valido.")
-    metadata, filings = _recent_filings(cik)
+    sec_status = "consultata"
+    try:
+        metadata, filings = _recent_filings(cik)
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        metadata, filings = {"name": company, "tickers": []}, []
+        sec_status = "non disponibile"
     company_name = metadata.get("name") or company
-    documents: list[dict] = []
+    filing_documents: list[dict] = []
     chunks: list[dict] = []
     for filing in filings:
         if not filing.get("document") or not filing.get("accession"):
@@ -395,7 +534,7 @@ def analyze_company(company: str, cik: str) -> dict:
             continue
         url = _filing_url(cik, filing)
         try:
-            raw = _fetch(url, max_bytes=MAX_FILING_BYTES)
+            raw = _fetch(url, max_bytes=MAX_FILING_BYTES, timeout=10)
             text = _html_to_text(raw)
             if len(text) < 300:
                 continue
@@ -404,8 +543,10 @@ def analyze_company(company: str, cik: str) -> dict:
                 "date": filing["date"],
                 "description": filing.get("description", ""),
                 "filing_url": url,
+                "source_url": url,
+                "source_class": "Filing regolamentare SEC",
             }
-            documents.append(source)
+            filing_documents.append(source)
             remaining = max(0, MAX_CHUNKS - len(chunks))
             if remaining:
                 chunks.extend(_chunks_for_filing(text, source, company_name, remaining))
@@ -434,6 +575,7 @@ def analyze_company(company: str, cik: str) -> dict:
                 "date": item["date"],
                 "description": item["description"],
                 "filing_url": item["filing_url"],
+                "source_url": item["filing_url"],
                 "entities": _extract_entities(mention["text"]),
                 "source_class": "Filing regolamentare SEC",
             })
@@ -445,29 +587,54 @@ def analyze_company(company: str, cik: str) -> dict:
     _spacy_nlp = None
     _spacy_checked = False
     gc.collect()
+
+    profile_documents, profile_evidence, profile_status = _curated_company_evidence(cik)
+    news_documents, news_evidence, news_status = _gdelt_context_evidence(company_name)
+    evidence.extend(profile_evidence)
+    evidence.extend(news_evidence)
+    evidence.sort(key=lambda item: (item["candidate"], item.get("date", "")), reverse=True)
+    documents = filing_documents + profile_documents + news_documents
+    source_status = [
+        {"source": "SEC EDGAR", "status": f"{len(filing_documents)} filing consultati" if sec_status == "consultata" else sec_status},
+        {"source": "Profilo aziendale ufficiale", "status": profile_status},
+        {"source": "Contesto notizie GDELT", "status": news_status},
+    ]
+
+    direct_evidence = any(
+        item["candidate"] and item.get("source_class") == "Fonte aziendale ufficiale"
+        for item in evidence
+    )
     if evidence and any(item["candidate"] for item in evidence):
-        verdict = "Possibile relazione: revisione analista necessaria"
-        explanation = (
-            "Sono state trovate menzioni di Israele vicine a termini di relazione nei filing "
-            "consultati. La corrispondenza lessicale non prova da sola una relazione societaria: "
-            "verifica il passaggio originale prima di concludere."
-        )
+        if direct_evidence:
+            verdict = "Attività in Israele dichiarate dall’azienda"
+            explanation = (
+                "Una fonte aziendale ufficiale descrive attività operative o di ricerca in Israele. "
+                "È un riscontro diretto attribuito all’azienda; apri la fonte per verificare data, "
+                "contesto e perimetro dell’attività."
+            )
+        else:
+            verdict = "Possibile relazione: revisione analista necessaria"
+            explanation = (
+                "Sono state trovate menzioni di Israele vicine a termini di relazione nelle fonti "
+                "consultate. Le corrispondenze, in particolare gli estratti giornalistici, sono "
+                "indizi da verificare nella fonte originale e non provano da sole una relazione."
+            )
     elif evidence:
         verdict = "Menzione trovata, relazione non stabilita"
         explanation = (
-            "I filing contengono menzioni di Israele, ma i passaggi recuperati non mostrano "
+            "Le fonti contengono menzioni di Israele, ma i passaggi recuperati non mostrano "
             "un termine di relazione riconosciuto. Questo risultato non dimostra un legame."
         )
     elif documents:
         verdict = "Nessuna evidenza trovata nel perimetro consultato"
         explanation = (
-            "Non sono state trovate menzioni pertinenti nei filing recuperati. La ricerca "
-            "copre solo i documenti SEC indicati sotto e non prova l’assenza di rapporti."
+            "Non sono stati trovati passaggi pertinenti nelle fonti recuperate. Il risultato non "
+            "prova l’assenza di rapporti; controlla lo stato delle fonti e il perimetro indicato."
         )
     else:
         verdict = "Analisi incompleta"
-        explanation = "Non è stato possibile recuperare filing analizzabili per questa società."
-    score = _evidence_score(evidence, len(documents), vector_used)
+        explanation = "Non è stato possibile recuperare fonti analizzabili nel perimetro configurato."
+    score = _evidence_score(evidence, len(filing_documents), vector_used)
     return {
         "company": company_name,
         "cik": cik,
@@ -480,12 +647,20 @@ def analyze_company(company: str, cik: str) -> dict:
         "evidence_count": len(evidence),
         "documents": documents,
         "evidence": evidence,
+        "source_status": source_status,
         "retrieval": {
             "bm25": True,
             "faiss": vector_used,
             "embedding_model": EMBEDDING_MODEL if vector_used else None,
+            "gdelt_context": news_status.startswith("consultata"),
+            "official_profile": profile_status == "consultata",
         },
-        "scope": "Ultimi filing SEC recuperabili tra 10-K, 20-F, 8-K e 6-K; ricerca lessicale e vettoriale in inglese.",
+        "scope": (
+            "Ultimi filing SEC recuperabili (10-K, 20-F, 8-K e 6-K), profili aziendali ufficiali "
+            "presenti nel catalogo verificato e contesto di notizie GDELT degli ultimi 3 giorni "
+            f"(massimo {MAX_NEWS_RESULTS} risultati). L’assenza di risultati non prova l’assenza "
+            "di rapporti; la copertura dei profili ufficiali varia per società."
+        ),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "report_id": hashlib.sha256(f"{cik}:{time.time_ns()}".encode()).hexdigest()[:12],
     }
