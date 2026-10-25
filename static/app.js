@@ -126,6 +126,8 @@
   }
 
   function verdictClass(verdict) {
+    if (verdict.startsWith("Relazione documentata")) return "green";
+    if (verdict.startsWith("Non verificato")) return "amber";
     if (verdict.startsWith("Attività in Israele dichiarate")) return "amber";
     if (verdict.startsWith("Possibile relazione")) return "amber";
     if (verdict.startsWith("Menzione trovata")) return "amber";
@@ -143,6 +145,38 @@
     </details>`).join("");
   }
 
+  function renderInitialSignal(signal) {
+    const refs = (signal.references || []).filter((url) => /^https:\/\//i.test(url));
+    const update = signal.source_updated_at
+      ? escapeHtml(signal.source_updated_at)
+      : "Non dichiarata dalla fonte";
+    const retrieved = signal.retrieved_at
+      ? new Date(signal.retrieved_at).toLocaleString("it-IT")
+      : "Data di acquisizione non disponibile";
+    return `<section class="initial-signal ${signal.matched ? "is-matched" : "is-empty"}">
+      <div class="signal-heading"><div><p class="eyebrow">PISTA INIZIALE · NON È UNA CONFERMA</p><h3>${signal.matched ? `Segnalazione per ${escapeHtml(signal.name)}` : signal.searched ? "Ricerca nelle liste completata" : "Fonti non raggiungibili"}</h3></div>
+        <span class="signal-state">${signal.matched ? "Da verificare" : signal.searched ? "Nessuna corrispondenza" : "Dato non disponibile"}</span></div>
+      <p class="signal-text">${escapeHtml(signal.description || "Nessun dettaglio disponibile.")}</p>
+      ${signal.impact ? `<p class="signal-meta">Priorità riportata dalla lista: <strong>${escapeHtml(signal.impact)}</strong>${signal.category ? ` · ${escapeHtml(signal.category)}` : ""}</p>` : ""}
+      <div class="signal-citation"><a href="${escapeHtml(signal.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(signal.source)} · apri fonte originale ↗</a>
+        <span>Ultimo aggiornamento: ${update}</span><span>Acquisita: ${escapeHtml(retrieved)}</span></div>
+      ${refs.length ? `<details class="signal-references"><summary>Riferimenti riportati dalla lista (${refs.length}) · non verificati</summary><ul>${refs.map((url) => `<li><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(new URL(url).hostname)} ↗</a></li>`).join("")}</ul></details>` : ""}
+    </section>`;
+  }
+
+  function renderReliability(result) {
+    const reliability = result.reliability || {};
+    const confirmations = result.primary_confirmations || [];
+    const count = Number(reliability.independent_primary_count || 0);
+    const sources = confirmations.map((source) => `<li><span><strong>${escapeHtml(source.domain)}</strong> · ${escapeHtml(source.source_class)}</span><a href="${escapeHtml(source.source_url)}" target="_blank" rel="noopener noreferrer">Apri citazione ↗</a></li>`).join("");
+    return `<section class="reliability-row ${count ? "has-confirmation" : "no-confirmation"}" aria-label="Conferme da fonti primarie indipendenti">
+      <div class="reliability-count"><p class="eyebrow">CONFERME PRIMARIE · DOMINI DISTINTI</p><strong>${count}</strong><span>${escapeHtml(reliability.label || "Nessuna conferma primaria")}</span></div>
+      <div class="reliability-detail"><p>${count ? "Il conteggio usa domini distinti con passaggi pertinenti in fonti aziendali ufficiali o filing regolamentari." : "La lista di segnalazione e gli articoli non valgono come conferme primarie: il verdetto resta non verificato."}</p>
+        ${count ? `<details class="confirmation-list"><summary>Esamina le conferme (${count})</summary><ul>${sources}</ul></details>` : ""}
+      </div><span class="reliability-note">${escapeHtml(reliability.note || "Conteggio, non probabilità")}</span>
+    </section>`;
+  }
+
   function renderReport(result) {
     state.result = result;
     const tone = verdictClass(result.verdict);
@@ -154,6 +188,8 @@
     $("#report").innerHTML = `<div class="report-topline"><span class="eyebrow">DOSSIER ${escapeHtml(result.report_id)}</span><div class="report-actions"><button id="export-report" class="text-button" type="button">Esporta JSON ↓</button><button id="print-report" class="text-button" type="button">Stampa</button></div></div>
       <div class="company-title"><div><h2>${escapeHtml(result.company)}</h2><p>${result.cik ? `${escapeHtml(result.ticker || "Emittente SEC")} · CIK ${escapeHtml(result.cik)}` : `${escapeHtml(result.identity_source || "Nome inserito")}${result.entity_id ? ` · ${escapeHtml(result.entity_id)}` : " · identità da verificare"}`}</p></div><span class="scope-chip">${docs.length} fonti</span></div>
       <section class="verdict-block ${tone}"><div class="verdict-symbol" aria-hidden="true">${tone === "amber" ? "!" : tone === "green" ? "✓" : "·"}</div><div class="verdict-content"><p class="eyebrow">VERDETTO</p><h1>${escapeHtml(result.verdict)}</h1><p>${escapeHtml(result.explanation)}</p></div></section>
+      ${renderReliability(result)}
+      ${result.initial_signal ? renderInitialSignal(result.initial_signal) : ""}
       <section class="confidence-row" aria-label="Indicatore di pertinenza delle evidenze"><div class="confidence-copy"><span class="eyebrow">QUALITÀ DEL RECUPERO</span><strong>${escapeHtml(result.confidence)}<small>/100</small></strong><span class="confidence-label">${confidenceLabel(result.confidence)}</span></div><progress class="confidence-meter" max="100" value="${Math.max(0, Math.min(100, result.confidence))}" aria-label="Punteggio di pertinenza"></progress><p class="confidence-note">${escapeHtml(result.confidence_label)} · Euristica da calibrare, non probabilità di legame.</p></section>
       <section class="reasoning"><p class="eyebrow">LETTURA DEL SISTEMA</p><p>${escapeHtml(result.explanation)}</p><div class="method-tags"><span>${escapeHtml(faissState)}</span><span>Entità NER negli estratti: ${entityCount}</span><span>${result.retrieval?.official_profile ? "Profilo ufficiale consultato" : "Profilo ufficiale non configurato"}</span><span>${result.retrieval?.gdelt_context ? "GDELT consultato" : "GDELT non disponibile"}</span></div></section>
       <section class="sources-section"><div class="sources-heading"><div><p class="eyebrow">EVIDENZE E CITAZIONI</p><h3>${evidence.length} passaggi da esaminare</h3></div><span class="source-count">${docs.length} fonti consultate</span></div><div class="evidence-list">${renderEvidence(evidence)}</div>

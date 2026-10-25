@@ -18,10 +18,11 @@ from collections import Counter
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, render_template, request
+from signal_sources import get_initial_signal
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
@@ -39,7 +40,7 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 APP_ACCESS_KEY = os.environ.get("APP_ACCESS_KEY", "")
-ASSET_VERSION = "3"
+ASSET_VERSION = "4"
 
 _analysis_lock = threading.Lock()
 _sec_lock = threading.Lock()
@@ -668,6 +669,69 @@ def _evidence_score(evidence: list[dict], filing_count: int, model_used: bool) -
                + (4 if model_used else 0) + (5 if primary else 0))
 
 
+PRIMARY_SOURCE_CLASSES = {"Fonte aziendale ufficiale", "Filing regolamentare SEC"}
+
+
+def _primary_tie_assertion(text: str) -> bool:
+    """Require an assertive company-to-Israel statement, not mere topic proximity."""
+    sentence = " ".join(str(text or "").casefold().split())
+    if not sentence or re.search(
+        r"\b(?:does not|do not|did not|has no|have no|no longer|without|"
+        r"may|might|could|potential|alleged|allegedly|reportedly|accused|"
+        r"claims?|allegation|risk of)\b",
+        sentence,
+    ):
+        return False
+    relation = (
+        r"(?:operat\w*|establish\w*|found\w*|set\s+up|maintain\w*|run\w*|"
+        r"own\w*|open\w*|base\w*|"
+        r"acquir\w*|invest\w*|manufactur\w*|sell\w*|suppl\w*|distribut\w*|"
+        r"sign\w*|enter\w* into|provid\w*|headquarter\w*|presence|facilit\w*|"
+        r"office\w*|subsidiar\w*|branch\w*|factory|factories|plant\w*|"
+        r"research and development center\w*|r&d center\w*|joint venture|contract\w*)"
+    )
+    israel = r"(?:israel|israeli|tel aviv|jerusalem|haifa|kiryat gat)"
+    # Positive action/location syntax is intentional: terms such as "Israel may
+    # affect operations" remain leads for review, not an automatic confirmation.
+    forward = rf"\b{relation}\b.{{0,100}}\b(?:in|within|across|to|with|from)\s+(?:the\s+)?{israel}\b"
+    reverse = rf"\b{israel}\b.{{0,55}}\b(?:office\w*|facilit\w*|subsidiar\w*|branch\w*|factory|factories|plant\w*|headquarter\w*|research and development center\w*|r&d center\w*)\b"
+    direct_israeli_entity = re.search(
+        r"\bisraeli\s+(?:company|multinational|corporation|business|subsidiary|startup|firm)\b",
+        sentence,
+    )
+    return bool(
+        re.search(forward, sentence)
+        or re.search(reverse, sentence)
+        or direct_israeli_entity
+    )
+
+
+def _independent_primary_confirmations(evidence: list[dict]) -> list[dict]:
+    """Count distinct primary-source domains with an Israel/relationship passage."""
+    by_domain: dict[str, dict] = {}
+    for item in evidence:
+        if item.get("source_class") not in PRIMARY_SOURCE_CLASSES:
+            continue
+        if not item.get("candidate") or not _primary_tie_assertion(item.get("text", "")):
+            continue
+        url = str(item.get("source_url", ""))
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            continue
+        domain = parsed.hostname.casefold().removeprefix("www.")
+        if not domain:
+            continue
+        by_domain.setdefault(domain, {
+            "domain": domain,
+            "source_class": item["source_class"],
+            "description": item.get("description", "Fonte primaria consultata"),
+            "source_url": url,
+            "date": item.get("date", ""),
+            "text": item["text"],
+        })
+    return sorted(by_domain.values(), key=lambda item: item["domain"])
+
+
 def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
     global _embedder, _spacy_nlp, _spacy_checked
     if cik and not re.fullmatch(r"\d{10}", cik):
@@ -758,47 +822,56 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
     evidence.extend(profile_evidence)
     evidence.extend(news_evidence)
     evidence.sort(key=lambda item: (item["candidate"], item.get("date", "")), reverse=True)
-    documents = filing_documents + profile_documents + news_documents
+    initial_research = get_initial_signal(company_name)
+    initial_signal = initial_research["signal"]
+    signal_document = {
+        "form": "Segnalazione iniziale",
+        "date": initial_signal.get("source_updated_at", ""),
+        "date_kind": "ultimo aggiornamento dichiarato dalla fonte",
+        "description": (
+            f"{initial_signal['name']} · segnalazione da verificare"
+            if initial_signal.get("matched") else "Ricerca effettuata nella lista; nessuna voce corrispondente"
+        ) if initial_signal.get("searched", True) else "Fonti di segnalazione non raggiungibili",
+        "source_url": initial_signal["source_url"],
+        "source_class": "Segnalazione iniziale (non prova)",
+    }
+    documents = filing_documents + profile_documents + news_documents + [signal_document]
     source_status = [
         {"source": "SEC EDGAR", "status": f"{len(filing_documents)} filing consultati" if sec_status == "consultata" else sec_status},
         {"source": "Profilo aziendale ufficiale", "status": profile_status},
         {"source": "Contesto notizie GDELT", "status": news_status},
+        {"source": "Lista HTML di segnalazione", "status": initial_research["providers"][0].get("status", "consultata; nessuna inferenza di conferma")},
+        {"source": "CSV TechForPalestine (fallback)", "status": initial_research["providers"][1].get("status", "non consultato")},
     ]
 
-    direct_evidence = any(
-        item["candidate"] and item.get("source_class") == "Fonte aziendale ufficiale"
-        for item in evidence
-    )
-    if evidence and any(item["candidate"] for item in evidence):
-        if direct_evidence:
-            verdict = "Attività in Israele dichiarate dall’azienda"
-            explanation = (
-                "Una fonte aziendale ufficiale descrive attività operative o di ricerca in Israele. "
-                "È un riscontro diretto attribuito all’azienda; apri la fonte per verificare data, "
-                "contesto e perimetro dell’attività."
-            )
-        else:
-            verdict = "Possibile relazione: revisione analista necessaria"
-            explanation = (
-                "Sono state trovate menzioni di Israele vicine a termini di relazione nelle fonti "
-                "consultate. Le corrispondenze, in particolare gli estratti giornalistici, sono "
-                "indizi da verificare nella fonte originale e non provano da sole una relazione."
-            )
-    elif evidence:
-        verdict = "Menzione trovata, relazione non stabilita"
+    primary_confirmations = _independent_primary_confirmations(evidence)
+    if primary_confirmations:
+        verdict = "Relazione documentata da fonte primaria"
         explanation = (
-            "Le fonti contengono menzioni di Israele, ma i passaggi recuperati non mostrano "
-            "un termine di relazione riconosciuto. Questo risultato non dimostra un legame."
-        )
-    elif documents:
-        verdict = "Nessuna evidenza trovata nel perimetro consultato"
-        explanation = (
-            "Non sono stati trovati passaggi pertinenti nelle fonti recuperate. Il risultato non "
-            "prova l’assenza di rapporti; controlla lo stato delle fonti e il perimetro indicato."
+            f"Almeno una fonte primaria consultata contiene un passaggio pertinente. "
+            f"Sono stati individuati {len(primary_confirmations)} domini primari distinti; "
+            "la lista iniziale resta una segnalazione e non determina il verdetto. Apri le citazioni "
+            "per controllare contesto, data e natura del rapporto."
         )
     else:
-        verdict = "Analisi incompleta"
-        explanation = "Non è stato possibile recuperare fonti analizzabili nel perimetro configurato."
+        verdict = "Non verificato"
+        if initial_signal.get("matched"):
+            explanation = (
+                "Una lista di segnalazioni riporta questa azienda, ma non è emersa una conferma "
+                "pertinente in una fonte primaria nel perimetro consultato. Articoli, liste e "
+                "risultati di ricerca non sono conteggiati come conferme. Il rapporto resta non verificato."
+            )
+        elif initial_signal.get("searched", True):
+            explanation = (
+                "Non è stata trovata una conferma pertinente in una fonte primaria nel perimetro "
+                "consultato, né una voce corrispondente nelle liste di segnalazione disponibili. "
+                "Questo esito non dimostra l’assenza di rapporti."
+            )
+        else:
+            explanation = (
+                "Non è stata trovata una conferma pertinente in una fonte primaria e le liste di "
+                "segnalazione non erano raggiungibili. L’esito è inconclusivo e non dimostra l’assenza di rapporti."
+            )
     if not cik:
         identity_note = (
             f" Identità selezionata tramite Wikidata ({entity_id}); verifica che corrisponda "
@@ -810,6 +883,14 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
     score = _evidence_score(evidence, len(filing_documents), vector_used)
     if not cik:
         score = min(score, 64)
+    confirmation_count = len(primary_confirmations)
+    reliability_label = (
+        "Nessuna conferma primaria"
+        if confirmation_count == 0 else
+        "Una fonte primaria · affidabilità limitata"
+        if confirmation_count == 1 else
+        f"{confirmation_count} domini primari distinti"
+    )
     return {
         "company": company_name,
         "cik": cik,
@@ -820,6 +901,14 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
         "explanation": explanation,
         "confidence": score,
         "confidence_label": "qualità/pertinenza del recupero, non probabilità di relazione",
+        "initial_signal": initial_signal,
+        "initial_signal_providers": initial_research["providers"],
+        "primary_confirmations": primary_confirmations,
+        "reliability": {
+            "independent_primary_count": confirmation_count,
+            "label": reliability_label,
+            "note": "Domini distinti usati come proxy di indipendenza; eventuali proprietari comuni non sono deduplicati. Non è una probabilità.",
+        },
         "source_count": len(documents),
         "evidence_count": len(evidence),
         "documents": documents,
@@ -838,6 +927,9 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
             "Quando è disponibile un CIK: ultimi filing SEC recuperabili (10-K, 20-F, 8-K e 6-K) "
             "e profili ufficiali nel catalogo verificato. Per ogni nome: indici GDELT di articoli "
             f"degli ultimi 3 mesi e snippet degli ultimi 3 giorni (massimo {MAX_NEWS_RESULTS} ciascuno). "
+            "La lista Boycott Israel e il CSV TechForPalestine sono solo fonti di segnalazioni: "
+            "non determinano il verdetto. Un risultato positivo richiede un passaggio pertinente "
+            "in almeno una fonte primaria; le conferme sono contate per dominio distinto. "
             "Wikidata aiuta a identificare candidati, non è un registro completo di tutte le aziende. "
             "La copertura varia per società e l’assenza di risultati non prova l’assenza di rapporti."
         ),
