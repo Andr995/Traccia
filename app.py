@@ -22,6 +22,7 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, render_template, request
+from alternative_recommendations import COUNTRIES, get_alternatives
 from signal_sources import get_initial_signal
 
 app = Flask(__name__)
@@ -40,7 +41,7 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 APP_ACCESS_KEY = os.environ.get("APP_ACCESS_KEY", "")
-ASSET_VERSION = "4"
+ASSET_VERSION = "5"
 
 _analysis_lock = threading.Lock()
 _sec_lock = threading.Lock()
@@ -732,7 +733,9 @@ def _independent_primary_confirmations(evidence: list[dict]) -> list[dict]:
     return sorted(by_domain.values(), key=lambda item: item["domain"])
 
 
-def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
+def analyze_company(
+    company: str, cik: str = "", entity_id: str = "", country_code: str = "IT"
+) -> dict:
     global _embedder, _spacy_nlp, _spacy_checked
     if cik and not re.fullmatch(r"\d{10}", cik):
         raise ValueError("CIK non valido.")
@@ -747,6 +750,9 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
         metadata, filings = {"name": company, "tickers": []}, []
         sec_status = "non applicabile: analisi per nome senza CIK SEC"
     company_name = metadata.get("name") or company
+    country_code = country_code.upper()
+    if country_code not in COUNTRIES:
+        raise ValueError("Paese non supportato per la ricerca delle alternative.")
     filing_documents: list[dict] = []
     chunks: list[dict] = []
     for filing in filings:
@@ -824,6 +830,7 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
     evidence.sort(key=lambda item: (item["candidate"], item.get("date", "")), reverse=True)
     initial_research = get_initial_signal(company_name)
     initial_signal = initial_research["signal"]
+    alternatives = get_alternatives(company_name, country_code)
     signal_document = {
         "form": "Segnalazione iniziale",
         "date": initial_signal.get("source_updated_at", ""),
@@ -897,6 +904,9 @@ def analyze_company(company: str, cik: str = "", entity_id: str = "") -> dict:
         "entity_id": entity_id,
         "identity_source": "Wikidata" if entity_id else ("SEC" if cik else "Nome inserito"),
         "ticker": metadata.get("tickers", [""])[0] if metadata.get("tickers") else "",
+        "country_code": country_code,
+        "country_name": COUNTRIES[country_code],
+        "alternatives": alternatives,
         "verdict": verdict,
         "explanation": explanation,
         "confidence": score,
@@ -1035,7 +1045,10 @@ def analyze():
     if not _analysis_lock.acquire(blocking=False):
         return jsonify({"error": "Un’analisi è già in corso. Riprova tra poco."}), 429
     try:
-        result = analyze_company(company, cik, entity_id)
+        country_code = str(payload.get("country_code", "IT")).upper()[:2]
+        if country_code not in COUNTRIES:
+            return jsonify({"error": "Seleziona un paese disponibile nel menu."}), 400
+        result = analyze_company(company, cik, entity_id, country_code)
         return jsonify(result)
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 503

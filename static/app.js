@@ -177,6 +177,22 @@
     </section>`;
   }
 
+  function renderAlternatives(result) {
+    const data = result.alternatives || {};
+    if (!data.applicable) return `<section class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI</p><h3>Alternative per ${escapeHtml(result.country_name || "il paese selezionato")}</h3></div></div><p class="alternatives-empty">Il catalogo non contiene ancora alternative documentate per questo marchio. L’assenza di suggerimenti non indica che non esistano.</p></section>`;
+    const entries = (data.items || []).map((item) => {
+      const screeningSources = (item.screening_sources || []).map((source) => `<li><span>${escapeHtml(source.source)} · ${escapeHtml(source.status)}</span>${/^https:\/\//i.test(source.source_url) ? `<a href="${escapeHtml(source.source_url)}" target="_blank" rel="noopener noreferrer">Apri ↗</a>` : ""}</li>`).join("");
+      return `<article class="alternative-item"><div class="alternative-topline"><div><p class="eyebrow">${escapeHtml(item.origin)}</p><h4>${escapeHtml(item.brand)} <span>· ${escapeHtml(item.product)}</span></h4></div><span class="alternative-status">${item.screening_complete ? "Nessuna segnalazione nelle liste" : "Screening incompleto"}</span></div>
+        <p class="alternative-description">${escapeHtml(item.description)}</p><div class="alternative-links"><a href="${escapeHtml(item.product_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.source_label)} ↗</a></div>
+        <p class="alternative-caveat">${escapeHtml(item.screening_status)}</p>${screeningSources ? `<details class="alternative-sources"><summary>Fonti usate per il controllo</summary><ul>${screeningSources}</ul></details>` : ""}
+      </article>`;
+    }).join("");
+    return `<section class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI · ${escapeHtml(data.country_name || result.country_name || "")}</p><h3>Alternative a ${escapeHtml(data.target || result.company)}</h3></div><span class="source-count">${(data.items || []).length} suggerimenti</span></div>
+      ${entries || `<p class="alternatives-empty">Non ci sono ancora alternative documentate per ${escapeHtml(data.country_name || result.country_name || "il paese selezionato")}.</p>`}
+      ${data.excluded_count ? `<p class="alternative-caveat">${data.excluded_count} candidato/i escluso/i perché presente/i in una lista di segnalazione.</p>` : ""}<p class="alternatives-disclaimer">${escapeHtml(data.catalog_note || "Il catalogo è parziale; una ricerca senza segnalazioni non dimostra l’assenza di legami.")}</p>
+    </section>`;
+  }
+
   function renderReport(result) {
     state.result = result;
     const tone = verdictClass(result.verdict);
@@ -190,6 +206,7 @@
       <section class="verdict-block ${tone}"><div class="verdict-symbol" aria-hidden="true">${tone === "amber" ? "!" : tone === "green" ? "✓" : "·"}</div><div class="verdict-content"><p class="eyebrow">VERDETTO</p><h1>${escapeHtml(result.verdict)}</h1><p>${escapeHtml(result.explanation)}</p></div></section>
       ${renderReliability(result)}
       ${result.initial_signal ? renderInitialSignal(result.initial_signal) : ""}
+      ${renderAlternatives(result)}
       <section class="confidence-row" aria-label="Indicatore di pertinenza delle evidenze"><div class="confidence-copy"><span class="eyebrow">QUALITÀ DEL RECUPERO</span><strong>${escapeHtml(result.confidence)}<small>/100</small></strong><span class="confidence-label">${confidenceLabel(result.confidence)}</span></div><progress class="confidence-meter" max="100" value="${Math.max(0, Math.min(100, result.confidence))}" aria-label="Punteggio di pertinenza"></progress><p class="confidence-note">${escapeHtml(result.confidence_label)} · Euristica da calibrare, non probabilità di legame.</p></section>
       <section class="reasoning"><p class="eyebrow">LETTURA DEL SISTEMA</p><p>${escapeHtml(result.explanation)}</p><div class="method-tags"><span>${escapeHtml(faissState)}</span><span>Entità NER negli estratti: ${entityCount}</span><span>${result.retrieval?.official_profile ? "Profilo ufficiale consultato" : "Profilo ufficiale non configurato"}</span><span>${result.retrieval?.gdelt_context ? "GDELT consultato" : "GDELT non disponibile"}</span></div></section>
       <section class="sources-section"><div class="sources-heading"><div><p class="eyebrow">EVIDENZE E CITAZIONI</p><h3>${evidence.length} passaggi da esaminare</h3></div><span class="source-count">${docs.length} fonti consultate</span></div><div class="evidence-list">${renderEvidence(evidence)}</div>
@@ -212,7 +229,7 @@
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: apiHeaders(true),
-        body: JSON.stringify({ company: state.selected.name, cik: state.selected.cik || "", entity_id: state.selected.entity_id || "" }),
+        body: JSON.stringify({ company: state.selected.name, cik: state.selected.cik || "", entity_id: state.selected.entity_id || "", country_code: $("#country-select").value }),
       });
       const payload = await readApiResponse(response);
       renderReport(payload);
@@ -272,6 +289,19 @@
     $("#search-status").textContent = "Selezione rimossa.";
   });
   $("#clear-history").addEventListener("click", () => { try { localStorage.removeItem(historyKey); } catch {} renderHistory(); });
+  const countrySelect = $("#country-select");
+  const supportedCountryCodes = new Set(Array.from(countrySelect.options, (option) => option.value));
+  let preferredCountry = "IT";
+  try {
+    const savedCountry = localStorage.getItem("traccia.country");
+    const localeCountry = navigator.language.split("-").pop().toUpperCase();
+    if (savedCountry && supportedCountryCodes.has(savedCountry)) preferredCountry = savedCountry;
+    else if (supportedCountryCodes.has(localeCountry)) preferredCountry = localeCountry;
+  } catch {}
+  countrySelect.value = preferredCountry;
+  countrySelect.addEventListener("change", () => {
+    try { localStorage.setItem("traccia.country", countrySelect.value); } catch {}
+  });
   $("#theme-toggle").addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
     document.documentElement.dataset.theme = next;
