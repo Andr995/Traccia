@@ -10,7 +10,6 @@ import csv
 import re
 import threading
 import time
-import unicodedata
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -18,6 +17,8 @@ from io import StringIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from company_identity import company_key as _canonical_name, normalize_name as _normal
 
 
 BOYCOTT_HTML_URL = "https://boycott-israel.org/boycott.html"
@@ -32,15 +33,11 @@ BOYCOTT_CSV_PAGE_URL = (
 MAX_SOURCE_BYTES = 2_000_000
 MAX_SOURCE_RECORDS = 5_000
 SOURCE_CACHE_SECONDS = 6 * 60 * 60
+SOURCE_FAILURE_SECONDS = 60
 
 _cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
-
-
-def _normal(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
-    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", " ", ascii_value).strip()
+_load_locks = {"boycott_html": threading.Lock(), "boycott_csv": threading.Lock()}
 
 
 def _compact(value: str, limit: int = 1800) -> str:
@@ -98,8 +95,8 @@ class BoycottHTMLParser(HTMLParser):
             self.capture = {"tag": tag, "kind": "company", "depth": 1, "parts": []}
         elif tag == "p" and self.current and not self.current.get("description"):
             self.capture = {"tag": tag, "kind": "description", "depth": 1, "parts": []}
-        elif self.capture:
-            self.capture["depth"] += 1
+        elif self.capture and tag == "br":
+            self.capture["parts"].append(" ")
 
         if self.current and tag == "a":
             href = attr.get("href", "").strip()
@@ -114,19 +111,15 @@ class BoycottHTMLParser(HTMLParser):
         if not self.capture:
             return
         if tag.lower() == self.capture["tag"]:
-            self.capture["depth"] -= 1
-            if self.capture["depth"] <= 0:
-                value = _compact(" ".join(self.capture["parts"]), 2200)
-                kind = self.capture["kind"]
-                self.capture = None
-                if kind == "category" and value:
-                    self.category = value
-                elif kind == "company" and value:
-                    self.current = self._new_entry(value)
-                elif kind == "description" and self.current and value:
-                    self.current["description"] = value
-        elif self.capture:
-            self.capture["depth"] = max(1, self.capture["depth"] - 1)
+            value = _compact(" ".join(self.capture["parts"]), 2200)
+            kind = self.capture["kind"]
+            self.capture = None
+            if kind == "category" and value:
+                self.category = value
+            elif kind == "company" and value:
+                self.current = self._new_entry(value)
+            elif kind == "description" and self.current and value:
+                self.current["description"] = value
 
     def handle_data(self, data: str) -> None:
         if self.capture:
@@ -150,7 +143,8 @@ class BoycottHTMLParser(HTMLParser):
     def _finish_entry(self) -> None:
         if self.current:
             self.current["description"] = _compact(self.current.get("description", ""))
-            self.records.append(self.current)
+            if len(self.records) < MAX_SOURCE_RECORDS:
+                self.records.append(self.current)
             self.current = None
 
     def close(self) -> None:
@@ -176,10 +170,17 @@ def _fetch(url: str) -> tuple[bytes, dict]:
 
 
 def _cached_source(key: str, loader) -> dict:
+    # Only one request downloads a given list on a cold cache.
+    with _load_locks[key]:
+        return _load_cached_source(key, loader)
+
+
+def _load_cached_source(key: str, loader) -> dict:
     now = time.monotonic()
     with _cache_lock:
         cached = _cache.get(key)
-        if cached and now - cached[0] < SOURCE_CACHE_SECONDS:
+        ttl = SOURCE_CACHE_SECONDS if cached and cached[1].get("ok") else SOURCE_FAILURE_SECONDS
+        if cached and now - cached[0] < ttl:
             return cached[1]
     try:
         value = loader()
@@ -188,7 +189,7 @@ def _cached_source(key: str, loader) -> dict:
     with _cache_lock:
         if len(_cache) >= 8:
             _cache.clear()
-        _cache[key] = (now, value)
+        _cache[key] = (time.monotonic(), value)
     return value
 
 
@@ -236,20 +237,6 @@ def _load_csv() -> dict:
     }
 
 
-def _canonical_name(value: str) -> str:
-    tokens = _normal(value).split()
-    while tokens and tokens[0] == "the":
-        tokens.pop(0)
-    suffixes = {
-        "inc", "incorporated", "corp", "corporation", "company", "co",
-        "plc", "ltd", "limited", "llc", "llp", "sa", "spa", "nv", "ag",
-        "gmbh", "group", "holdings", "holding",
-    }
-    while tokens and tokens[-1] in suffixes:
-        tokens.pop()
-    return " ".join(tokens)
-
-
 def _record_matches(query: str, record: dict) -> bool:
     query_names = {_canonical_name(query), _normal(query)} - {""}
     record_names = {
@@ -289,6 +276,7 @@ def _provider(source: dict, display_url: str, label: str) -> dict:
 def get_initial_signal(company: str) -> dict:
     """Return a matched lead or a source-search record; never mark it verified."""
     html_source = _cached_source("boycott_html", _load_html)
+    csv_source = {}
     html_match = next((
         row for row in html_source.get("records", []) if _record_matches(company, row)
     ), None)
@@ -331,7 +319,7 @@ def get_initial_signal(company: str) -> dict:
             "status": "segnalazione iniziale da verificare",
         }
     else:
-        searched = bool(html_source.get("ok") or _cache.get("boycott_csv", (0, {}))[1].get("ok"))
+        searched = bool(html_source.get("ok") or csv_source.get("ok"))
         signal = {
             "name": "",
             "impact": "",
@@ -358,7 +346,6 @@ def get_initial_signal(company: str) -> dict:
         if html_source.get("ok") else
         "non disponibile o formato non riconosciuto"
     )
-    csv_cached = _cache.get("boycott_csv", (0, {}))[1]
     return {
         "signal": signal,
         "providers": [
@@ -368,7 +355,7 @@ def get_initial_signal(company: str) -> dict:
             },
             {
                 **_provider(
-                    csv_cached,
+                    csv_source,
                     BOYCOTT_CSV_PAGE_URL,
                     "TechForPalestine — CSV di fallback",
                 ),
@@ -377,3 +364,22 @@ def get_initial_signal(company: str) -> dict:
         ],
         "matched": bool(record),
     }
+
+
+def screen_names(names: list[str]) -> dict:
+    """Screen a candidate and supplied owner names, preserving source dates."""
+    checked = list(dict.fromkeys(name.strip() for name in names if isinstance(name, str) and name.strip()))
+    by_source = {}
+    complete = bool(checked)
+    for name in checked:
+        result = get_initial_signal(name)
+        if result["matched"]:
+            return {"matched": True, "complete": False, "providers": result["providers"]}
+        providers = result["providers"]
+        complete = complete and len(providers) >= 2 and all(item["available"] for item in providers)
+        for provider in providers:
+            key = provider["source_url"]
+            previous = by_source.get(key)
+            if previous is None or not provider["available"]:
+                by_source[key] = dict(provider)
+    return {"matched": False, "complete": complete, "providers": list(by_source.values())}

@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "description": "Browser regression checks only; Render runs the Python application.",
+  "scripts": { "test": "node tests/frontend.cjs" },
+  "devDependencies": { "jsdom": "22.1.0" }
+}

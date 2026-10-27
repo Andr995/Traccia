@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
-import unicodedata
 from collections import Counter
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from company_identity import (
+    company_key as _company_key, normalize_name as _norm, public_link,
+    business_description, unrelated_description,
+)
 
 
 ENTITY_DATA_URL = "https://www.wikidata.org/wiki/Special:EntityData/{entity_id}.json?flavor=simple"
@@ -27,7 +33,8 @@ COUNTRY_NAMES = {
 MAX_INDUSTRIES = 4
 MAX_CANDIDATES = 40
 CACHE_TTL_SECONDS = 6 * 60 * 60
-_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+FAILURE_CACHE_SECONDS = 60
+_cache: dict[tuple, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
 _STOP_WORDS = set("""
 the and for with from that this were was are has have had its into their they
@@ -36,34 +43,6 @@ companies business businesses group corporation limited italian french german
 spanish united states producer manufacturer industry of to in on by is at a an
 di del della dei delle e la il le per con azienda gruppo produttore società
 """.split())
-_LEGAL_SUFFIXES = {
-    "inc", "incorporated", "corp", "corporation", "company", "co", "plc",
-    "ltd", "limited", "llc", "llp", "sa", "spa", "srl", "sas", "sarl",
-    "nv", "ag", "gmbh",
-    "group", "holdings", "holding",
-}
-
-
-def _norm(value: str) -> str:
-    folded = unicodedata.normalize("NFKD", str(value or "").casefold())
-    ascii_value = folded.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", " ", ascii_value).strip()
-
-
-def _company_key(value: str) -> str:
-    tokens = _norm(value).split()
-    while tokens and tokens[0] == "the":
-        tokens.pop(0)
-    while tokens:
-        if len(tokens) >= 3 and tuple(tokens[-3:]) in {("s", "p", "a"), ("s", "r", "l")}:
-            tokens = tokens[:-3]
-        elif len(tokens) >= 2 and tuple(tokens[-2:]) in {("s", "a"), ("b", "v"), ("s", "c")}:
-            tokens = tokens[:-2]
-        elif tokens[-1] in _LEGAL_SUFFIXES:
-            tokens.pop()
-        else:
-            break
-    return " ".join(tokens)
 
 
 def _tokens(value: str) -> list[str]:
@@ -86,11 +65,11 @@ def _bm25(query: str, documents: list[str]) -> list[float]:
             frequency = counts.get(term, 0)
             if not frequency:
                 continue
-            inverse = 1.0 + max(
+            inverse = math.log1p(max(
                 0.0,
                 (len(tokenized) - document_frequency[term] + 0.5)
                 / (document_frequency[term] + 0.5),
-            )
+            ))
             denominator = frequency + 1.5 * (
                 1.0 - 0.75 + 0.75 * len(tokens) / max(average_length, 1)
             )
@@ -109,7 +88,10 @@ def _fetch_json(url: str, *, accept: str = "application/json", timeout: int = 8)
         body = response.read(1_000_001)
     if len(body) > 1_000_000:
         raise ValueError("Risposta Wikidata oltre il limite configurato.")
-    return json.loads(body.decode("utf-8", errors="replace"))
+    payload = json.loads(body.decode("utf-8", errors="replace"))
+    if not isinstance(payload, dict) or payload.get("error"):
+        raise ValueError("Risposta Wikidata non valida.")
+    return payload
 
 
 def _resolve_entity(company: str, entity_id: str = "") -> str:
@@ -119,111 +101,211 @@ def _resolve_entity(company: str, entity_id: str = "") -> str:
         "action": "wbsearchentities", "search": company[:100], "language": "en",
         "format": "json", "formatversion": "2", "type": "item", "limit": "6",
     }
-    try:
-        payload = _fetch_json(f"{WIKIDATA_API_URL}?{urlencode(params)}", timeout=6)
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
-        return ""
+    payload = _fetch_json(f"{WIKIDATA_API_URL}?{urlencode(params)}", timeout=6)
     query_key = _company_key(company)
-    for row in payload.get("search", [])[:6] if isinstance(payload, dict) else []:
+    rows = payload.get("search")
+    if not isinstance(rows, list):
+        raise ValueError("Risultati di ricerca Wikidata non validi.")
+    matches = set()
+    exact_labels = set()
+    exact_products = set()
+    businesses = set()
+    for row in rows[:6]:
         if not isinstance(row, dict):
             continue
+        if unrelated_description(row.get("description", "")):
+            continue
         entity_id = str(row.get("id", ""))
-        label_key = _company_key(str(row.get("label", "")))
-        if query_key and query_key == label_key and re.fullmatch(r"Q[1-9]\d*", entity_id):
-            return entity_id
-    return ""
+        matched = row.get("match") or {}
+        names = [row.get("label", ""), matched.get("text", "") if isinstance(matched, dict) else ""]
+        if _norm(company) == _norm(row.get("label", "")) and re.fullmatch(r"Q[1-9]\d*", entity_id):
+            exact_labels.add(entity_id)
+            if re.search(r"\b(?:brand|drink|confectionery|product|chocolate|footwear)\b", str(row.get("description", "")), re.I):
+                exact_products.add(entity_id)
+        if query_key and query_key in {_company_key(name) for name in names} and re.fullmatch(r"Q[1-9]\d*", entity_id):
+            matches.add(entity_id)
+            if business_description(row.get("description", "")):
+                businesses.add(entity_id)
+    # Do not silently choose the first of several homonymous entities.
+    if len(exact_products) == 1:
+        return next(iter(exact_products))
+    if businesses:
+        return next(iter(businesses)) if len(businesses) == 1 else ""
+    if len(exact_labels) == 1:
+        return next(iter(exact_labels))
+    return next(iter(matches)) if len(matches) == 1 else ""
 
 
-def _industry_ids(entity_id: str) -> tuple[list[str], str]:
+def _entity(entity_id: str) -> dict:
     payload = _fetch_json(ENTITY_DATA_URL.format(entity_id=entity_id), timeout=8)
     entities = payload.get("entities", {}) if isinstance(payload, dict) else {}
     entity = entities.get(entity_id, {}) if isinstance(entities, dict) else {}
-    claims = entity.get("claims", {}) if isinstance(entity, dict) else {}
-    industries = []
-    for statement in claims.get("P452", []) if isinstance(claims, dict) else []:
+    if not isinstance(entity, dict) or "missing" in entity or not isinstance(entity.get("claims"), dict):
+        raise ValueError("Scheda Wikidata non disponibile.")
+    return entity
+
+
+def _claim_ids(entity: dict, property_id: str) -> list[str]:
+    claims = entity.get("claims") or {}
+    statements = claims.get(property_id, []) if isinstance(claims, dict) else []
+    ids = []
+    for statement in statements if isinstance(statements, list) else []:
         if not isinstance(statement, dict) or statement.get("rank") == "deprecated":
             continue
-        value = statement.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+        qualifiers = statement.get("qualifiers") or {}
+        if isinstance(qualifiers, dict) and qualifiers.get("P582"):
+            continue  # Bounded conservative fallback: skip dated/historical relationships.
+        snak = statement.get("mainsnak") or {}
+        data = (snak.get("datavalue") or {}) if isinstance(snak, dict) else {}
+        value = data.get("value") if isinstance(data, dict) else None
         qid = str(value.get("id", "")) if isinstance(value, dict) else ""
-        if re.fullmatch(r"Q[1-9]\d*", qid) and qid not in industries:
-            industries.append(qid)
-        if len(industries) >= MAX_INDUSTRIES:
-            break
-    descriptions = entity.get("descriptions", {}) if isinstance(entity, dict) else {}
-    description = str(
-        (descriptions.get("en") or descriptions.get("it") or {}).get("value", "")
-    )[:300] if isinstance(descriptions, dict) else ""
-    return industries, description
+        if re.fullmatch(r"Q[1-9]\d*", qid) and qid not in ids:
+            ids.append(qid)
+    return ids[:MAX_INDUSTRIES]
 
 
-def _peer_query(target_id: str, country_qid: str, industry_ids: list[str]) -> str:
+def _localized(entity: dict, field: str) -> str:
+    values = entity.get(field) or {}
+    if not isinstance(values, dict):
+        return ""
+    for language in ("en", "it"):
+        value = values.get(language)
+        if isinstance(value, dict) and isinstance(value.get("value"), str):
+            return value["value"][:300]
+    return ""
+
+
+def _peer_query(target_id: str, country_qid: str, industry_ids: list[str], excluded_ids: list[str], product_ids: list[str]) -> str:
     values = " ".join(f"wd:{qid}" for qid in industry_ids)
+    excluded = ", ".join(f"wd:{qid}" for qid in sorted(set([target_id, *excluded_ids])))
+    product_filter = ""
+    if product_ids:
+        products = " ".join(f"wd:{qid}" for qid in product_ids)
+        product_filter = f"""
+  FILTER EXISTS {{
+    VALUES ?targetProduct {{ {products} }}
+    ?company wdt:P1056 ?output .
+    ?output wdt:P279* ?targetProduct .
+  }}
+"""
     return f"""
-SELECT DISTINCT ?company ?companyLabel ?companyDescription ?website ?industryLabel WHERE {{
+SELECT DISTINCT ?company ?companyLabel ?descriptionEn ?descriptionIt ?website ?industryLabel ?parent ?parentLabel WHERE {{
+  {{ SELECT DISTINCT ?company ?industry ?website WHERE {{
   VALUES ?industry {{ {values} }}
   ?company wdt:P452 ?industry ; wdt:P856 ?website .
-  FILTER(?company != wd:{target_id})
-  FILTER NOT EXISTS {{ ?company wdt:P749 wd:{target_id} . }}
+  FILTER(?company NOT IN ({excluded}))
+  FILTER NOT EXISTS {{ ?company (wdt:P749|wdt:P127) ?owner . FILTER(?owner IN ({excluded})) }}
   {{ ?company wdt:P17 wd:{country_qid} . }} UNION {{
     ?company wdt:P159 ?headquarters .
     ?headquarters wdt:P17 wd:{country_qid} .
   }}
-  OPTIONAL {{ ?company schema:description ?companyDescription .
-    FILTER(LANG(?companyDescription) = "it" || LANG(?companyDescription) = "en") }}
+  }} ORDER BY ?company LIMIT {MAX_CANDIDATES} }}
+  {product_filter}
+  OPTIONAL {{ ?company schema:description ?descriptionEn . FILTER(LANG(?descriptionEn) = "en") }}
+  OPTIONAL {{ ?company schema:description ?descriptionIt . FILTER(LANG(?descriptionIt) = "it") }}
+  OPTIONAL {{ ?company (wdt:P749|wdt:P127) ?parent . }}
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "it,en". }}
 }}
-LIMIT {MAX_CANDIDATES}
+ORDER BY ?company ?parent
+LIMIT {MAX_CANDIDATES * 4}
 """.strip()
 
 
-def _discover(company: str, country_code: str, entity_id: str) -> dict:
+def _binding(row: dict, key: str) -> str:
+    value = row.get(key)
+    return str(value.get("value") or "").strip() if isinstance(value, dict) else ""
+
+
+def _discover(company: str, country_code: str, entity_id: str, category_ids: tuple[str, ...] = ()) -> dict:
     code = str(country_code or "IT").upper()
     country_qid = COUNTRY_QIDS.get(code)
     if not country_qid:
         return {"items": [], "status": "paese non disponibile nel catalogo automatico"}
-    resolved_id = _resolve_entity(company, entity_id)
-    if not resolved_id:
-        return {"items": [], "status": "identità Wikidata non risolta con corrispondenza esatta"}
-    key = (resolved_id, code)
+    key = (entity_id or _norm(company), code, category_ids)
     now = time.monotonic()
     with _cache_lock:
         cached = _cache.get(key)
-        if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        ttl = FAILURE_CACHE_SECONDS if cached and cached[1].get("retryable") else CACHE_TTL_SECONDS
+        if cached and now - cached[0] < ttl:
             return {**cached[1], "cache_hit": True}
+    metadata = {}
     try:
-        industries, target_description = _industry_ids(resolved_id)
+        resolved_id = _resolve_entity(company, entity_id)
+        if not resolved_id:
+            return {"items": [], "status": "Identità assente o ambigua: cerca e seleziona la scheda Wikidata dell’azienda.", "retryable": True}
+        target = _entity(resolved_id)
+        profile = target
+        profile_id = resolved_id
+        industries = _claim_ids(target, "P452")
+        related = list(dict.fromkeys(
+            _claim_ids(target, "P749") + _claim_ids(target, "P127") + _claim_ids(target, "P176")
+        ))
+        # A brand/product often has no industry. Follow a documented manufacturer
+        # or owner for discovery only; keep the report identity unchanged.
+        if not industries:
+            for related_id in related[:2]:
+                candidate_profile = _entity(related_id)
+                candidate_industries = _claim_ids(candidate_profile, "P452")
+                if candidate_industries:
+                    profile, industries = candidate_profile, candidate_industries
+                    profile_id = related_id
+                    break
+        target_description = _localized(profile, "descriptions")
+        related = list(dict.fromkeys(related + _claim_ids(profile, "P749") + _claim_ids(profile, "P127")))
+        metadata = {
+            "entity_id": resolved_id,
+            "entity_url": f"https://www.wikidata.org/wiki/{resolved_id}",
+            "profile_url": f"https://www.wikidata.org/wiki/{profile_id}",
+            "profile_name": _localized(profile, "labels") or company,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        }
         if not industries:
             result = {"items": [], "status": "Wikidata non riporta un settore (P452) per l’azienda"}
         else:
-            params = {"query": _peer_query(resolved_id, country_qid, industries), "format": "json"}
+            excluded_ids = [resolved_id, profile_id, *related]
+            # A named product (e.g. a cola) must not inherit every product line
+            # of its manufacturer (e.g. alcoholic beverages).
+            products = list(category_ids) or (_claim_ids(target, "P279") if profile_id != resolved_id else _claim_ids(profile, "P1056"))
+            params = {"query": _peer_query(resolved_id, country_qid, industries, excluded_ids, products), "format": "json"}
             payload = _fetch_json(
                 f"{WDQS_URL}?{urlencode(params)}",
                 accept="application/sparql-results+json",
-                timeout=10,
+                timeout=15,
             )
-            rows = payload.get("results", {}).get("bindings", [])
-            candidates = []
-            seen = set()
-            for row in rows[:MAX_CANDIDATES] if isinstance(rows, list) else []:
+            results = payload.get("results")
+            rows = results.get("bindings") if isinstance(results, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError("Risposta del servizio di confronto non valida.")
+            by_id = {}
+            for row in rows[:MAX_CANDIDATES * 4]:
                 if not isinstance(row, dict):
                     continue
-                uri = str(row.get("company", {}).get("value", ""))
+                uri = _binding(row, "company")
                 match = re.search(r"/(Q[1-9]\d*)$", uri)
                 candidate_id = match.group(1) if match else ""
-                name = str(row.get("companyLabel", {}).get("value", "")).strip()
-                website = str(row.get("website", {}).get("value", "")).strip()
-                if (not candidate_id or candidate_id in seen or not name
-                        or not website.startswith(("https://", "http://"))):
+                name = _binding(row, "companyLabel")
+                website = public_link(_binding(row, "website"))
+                if (not candidate_id or candidate_id in excluded_ids or not name or name == candidate_id
+                        or _company_key(name) == _company_key(company) or not website):
                     continue
-                seen.add(candidate_id)
-                candidates.append({
+                candidate = by_id.setdefault(candidate_id, {
                     "id": candidate_id,
                     "name": name[:140],
-                    "description": str(row.get("companyDescription", {}).get("value", ""))[:260],
+                    "description": (_binding(row, "descriptionEn") or _binding(row, "descriptionIt"))[:260],
                     "website": website[:500],
-                    "industry": str(row.get("industryLabel", {}).get("value", "settore correlato"))[:140],
+                    "industry": _binding(row, "industryLabel")[:140] or "settore correlato",
                     "wikidata_url": f"https://www.wikidata.org/wiki/{candidate_id}",
+                    "parents": [],
+                    "ownership_incomplete": False,
                 })
+                parent_uri = _binding(row, "parent")
+                parent_name = _binding(row, "parentLabel")
+                if parent_uri:
+                    if not parent_name or re.fullmatch(r"Q\d+", parent_name):
+                        candidate["ownership_incomplete"] = True
+                    elif parent_name not in candidate["parents"]:
+                        candidate["parents"].append(parent_name[:140])
+            candidates = list(by_id.values())[:MAX_CANDIDATES]
             industry_labels = list(dict.fromkeys(item["industry"] for item in candidates))
             target_text = f"{company} {target_description} {' '.join(industry_labels)}"
             scores = _bm25(target_text, [
@@ -239,42 +321,41 @@ def _discover(company: str, country_code: str, entity_id: str) -> dict:
                 })
             result = {
                 "items": items,
-                "status": f"{len(items)} imprese dello stesso settore Wikidata nel paese selezionato",
-                "entity_id": resolved_id,
-                "entity_url": f"https://www.wikidata.org/wiki/{resolved_id}",
+                "status": f"{len(items)} imprese dello stesso settore Wikidata nel paese selezionato" + (" e con una categoria di prodotto in comune" if products else "; prodotti non confrontabili per dati mancanti"),
+                "product_comparison": bool(products),
             }
+        result.update(metadata)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
-        result = {"items": [], "status": "ricerca Wikidata temporaneamente non disponibile"}
+        result = {**metadata, "items": [], "status": "Ricerca Wikidata temporaneamente non disponibile; puoi riprovare tra un minuto.", "retryable": True}
     with _cache_lock:
         if len(_cache) >= 128:
             _cache.clear()
-        _cache[key] = (now, result)
+        _cache[key] = (time.monotonic(), result)
     return result
 
 
 def get_automatic_alternatives(
-    company: str, country_code: str, entity_id: str = "", limit: int = 3
+    company: str, country_code: str, entity_id: str = "", limit: int = 3,
+    category_ids: tuple[str, ...] = (),
 ) -> dict:
     """Find local same-industry peers; these are leads, not cleared alternatives."""
     if limit <= 0:
         return {"items": [], "status": "limite di suggerimenti raggiunto", "excluded_count": 0}
-    discovery = _discover(company, country_code, entity_id)
+    discovery = _discover(company, country_code, entity_id, category_ids)
     selected = []
     excluded_count = 0
-    from signal_sources import get_initial_signal
+    from signal_sources import screen_names
 
     for candidate in discovery.get("items", []):
-        screened = get_initial_signal(candidate["name"])
+        screened = screen_names([candidate["name"], *candidate.get("parents", [])])
         if screened.get("matched"):
             excluded_count += 1
             continue
         providers = screened.get("providers", [])
-        lists_checked = len(providers) >= 2 and all(
-            bool(provider.get("available")) for provider in providers
-        )
+        lists_checked = screened["complete"]
         selected.append({
             "brand": candidate["name"],
-            "product": "Impresa della stessa categoria · non verifica un prodotto specifico",
+            "product": "Categoria di prodotto in comune" if discovery.get("product_comparison") else "Stesso settore · prodotto da verificare",
             "origin": f"Paese associato su Wikidata: {COUNTRY_NAMES.get(country_code, 'paese selezionato')}",
             "description": (
                 f"Wikidata associa questa impresa al settore {candidate['industry']} e al paese selezionato. "
@@ -286,17 +367,16 @@ def get_automatic_alternatives(
             "category_label": f"Scheda e settore Wikidata: {candidate['industry']}",
             "similarity_score": candidate["similarity_score"],
             "automatic": True,
+            "ownership_note": (
+                "Nomi societari collegati controllati: " + ", ".join(candidate["parents"]) + ". Controllo limitato ai collegamenti riportati da Wikidata."
+                if candidate.get("parents") else "Wikidata non riporta nomi di proprietari utilizzabili: struttura societaria non verificata."
+            ) + (" Alcuni proprietari non sono identificabili per nome." if candidate.get("ownership_incomplete") else ""),
             "screening_status": (
                 "Nessuna segnalazione trovata nelle liste consultate; questo non esclude altri legami."
                 if lists_checked else "Screening delle liste incompleto; legami non verificati."
             ),
             "screening_complete": lists_checked,
-            "screening_sources": [
-                {"source": provider.get("source", "Fonte lista"),
-                 "source_url": provider.get("source_url", ""),
-                 "status": provider.get("status", "non disponibile")}
-                for provider in providers
-            ],
+            "screening_sources": providers,
         })
         if len(selected) >= limit:
             break
@@ -305,5 +385,9 @@ def get_automatic_alternatives(
         "status": discovery.get("status", "ricerca automatica non disponibile"),
         "entity_id": discovery.get("entity_id", ""),
         "entity_url": discovery.get("entity_url", ""),
+        "profile_url": discovery.get("profile_url", ""),
+        "profile_name": discovery.get("profile_name", ""),
+        "retrieved_at": discovery.get("retrieved_at", ""),
+        "retryable": bool(discovery.get("retryable")),
         "excluded_count": excluded_count,
     }

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import hmac
 import html
 import json
+import math
 import os
 import re
 import threading
@@ -22,7 +24,9 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 from alternative_recommendations import COUNTRIES, get_alternatives
+from company_identity import company_key, normalize_name, unrelated_description
 from signal_sources import get_initial_signal
 
 app = Flask(__name__)
@@ -41,16 +45,17 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 APP_ACCESS_KEY = os.environ.get("APP_ACCESS_KEY", "")
-ASSET_VERSION = "7"
+ASSET_VERSION = "8"
 
 _analysis_lock = threading.Lock()
+_alternatives_lock = threading.Lock()
 _sec_lock = threading.Lock()
 _rate_lock = threading.Lock()
 _last_sec_request = 0.0
 _embedder = None
 _spacy_nlp = None
 _spacy_checked = False
-_request_counts: dict[str, list[float]] = {}
+_request_counts: dict[tuple[str, str], list[float]] = {}
 _wikidata_cache: dict[str, tuple[float, list[dict]]] = {}
 _wikidata_cache_lock = threading.Lock()
 
@@ -172,7 +177,7 @@ def _fetch(
 
 
 def _normalize_company(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+    return normalize_name(value)
 
 
 def find_companies(query: str) -> list[dict]:
@@ -182,9 +187,13 @@ def find_companies(query: str) -> list[dict]:
     query_tokens = query_norm.split()
     query_ticker = re.sub(r"[^A-Z0-9]", "", query.upper())
     payload = json.loads(_fetch(SEC_TICKERS_URL, max_bytes=8_000_000))
+    if not isinstance(payload, dict):
+        raise ValueError("Catalogo SEC non valido.")
     matches = []
     for row in payload.values():
-        title = row.get("title", "")
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "")
         normalized = _normalize_company(title)
         title_tokens = normalized.split()
         ticker = re.sub(r"[^A-Z0-9]", "", str(row.get("ticker", "")).upper())
@@ -241,6 +250,8 @@ def find_wikidata_entities(query: str) -> list[dict]:
     for row in rows[:6]:
         if not isinstance(row, dict):
             continue
+        if unrelated_description(row.get("description", "")):
+            continue
         entity_id = str(row.get("id", ""))
         label = str(row.get("label", "")).strip()
         if not re.fullmatch(r"Q[1-9]\d*", entity_id) or not label:
@@ -263,8 +274,16 @@ def find_wikidata_entities(query: str) -> list[dict]:
 
 def _recent_filings(cik: str) -> tuple[dict, list[dict]]:
     submissions = json.loads(_fetch(SEC_SUBMISSIONS_URL.format(cik=cik), timeout=10))
-    recent = submissions.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
+    if not isinstance(submissions, dict):
+        raise ValueError("Risposta SEC non valida.")
+    filings = submissions.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict) or not isinstance(recent.get("form"), list):
+        raise ValueError("Elenco filing SEC non valido.")
+    forms = recent["form"]
+    def value_at(field, index):
+        values = recent.get(field)
+        return str(values[index] or "") if isinstance(values, list) and index < len(values) else ""
     selected = []
     accepted_forms = {"10-K", "10-K/A", "20-F", "20-F/A", "8-K", "8-K/A", "6-K", "6-K/A"}
     rows = []
@@ -273,11 +292,10 @@ def _recent_filings(cik: str) -> tuple[dict, list[dict]]:
             continue
         rows.append({
             "form": form,
-            "date": recent.get("filingDate", [""])[index],
-            "accession": recent.get("accessionNumber", [""])[index],
-            "document": recent.get("primaryDocument", [""])[index],
-            "description": recent.get("primaryDocDescription", [""])[index]
-            if index < len(recent.get("primaryDocDescription", [])) else "",
+            "date": value_at("filingDate", index),
+            "accession": value_at("accessionNumber", index),
+            "document": value_at("primaryDocument", index),
+            "description": value_at("primaryDocDescription", index),
         })
     annual = [row for row in rows if row["form"].startswith(("10-K", "20-F"))]
     current = [row for row in rows if row["form"].startswith(("8-K", "6-K"))]
@@ -286,7 +304,7 @@ def _recent_filings(cik: str) -> tuple[dict, list[dict]]:
         selected.append(annual[0])
     selected.extend(current[:max(0, MAX_FILINGS - len(selected))])
     if len(selected) < MAX_FILINGS:
-        selected.extend(annual[1:MAX_FILINGS - len(selected)])
+        selected.extend(annual[1:1 + MAX_FILINGS - len(selected)])
     selected = selected[:MAX_FILINGS]
     return submissions, selected
 
@@ -351,7 +369,7 @@ def _bm25_scores(query: str, documents: list[str]) -> list[float]:
                 continue
             df = document_frequency[term]
             inverse = max(0.0, (n_docs - df + 0.5) / (df + 0.5))
-            inverse = (inverse + 1.0)  # smooth IDF for small corpora
+            inverse = math.log1p(inverse)
             denominator = freq + k1 * (1.0 - b + b * len(tokens) / max(avg_len, 1))
             score += inverse * (freq * (k1 + 1.0)) / denominator
         scores.append(score)
@@ -377,7 +395,7 @@ def _semantic_scores(query: str, documents: list[str]) -> list[float] | None:
         import numpy as np
 
         model = _get_embedder()
-        doc_vectors = np.asarray(list(model.embed(documents)), dtype="float32")
+        doc_vectors = np.asarray(list(model.embed(documents, batch_size=8)), dtype="float32")
         query_vectors = np.asarray(list(model.query_embed(query)), dtype="float32")
         if doc_vectors.ndim != 2 or not len(doc_vectors):
             return None
@@ -637,7 +655,7 @@ def _get_spacy():
     try:
         import spacy
 
-        _spacy_nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer"])
+        _spacy_nlp = spacy.load("en_core_web_sm", exclude=["parser", "lemmatizer", "tagger", "attribute_ruler"])
     except Exception:
         _spacy_nlp = None
     return _spacy_nlp
@@ -673,16 +691,23 @@ def _evidence_score(evidence: list[dict], filing_count: int, model_used: bool) -
 PRIMARY_SOURCE_CLASSES = {"Fonte aziendale ufficiale", "Filing regolamentare SEC"}
 
 
-def _primary_tie_assertion(text: str) -> bool:
+def _primary_tie_assertion(text: str, company: str = "") -> bool:
     """Require an assertive company-to-Israel statement, not mere topic proximity."""
     sentence = " ".join(str(text or "").casefold().split())
     if not sentence or re.search(
-        r"\b(?:does not|do not|did not|has no|have no|no longer|without|"
+        r"\b(?:not|no|never|denies|denied|ceased|without|"
         r"may|might|could|potential|alleged|allegedly|reportedly|accused|"
         r"claims?|allegation|risk of)\b",
         sentence,
     ):
         return False
+    if company:
+        identity = company_key(company)
+        normalized = normalize_name(sentence)
+        if re.search(r"\b(?:our|the)\s+(?:competitors?|industry peers|other companies)\b", sentence):
+            return False
+        if not (identity and f" {identity} " in f" {normalized} ") and not re.search(r"\b(?:we|our)\b", sentence):
+            return False
     relation = (
         r"(?:operat\w*|establish\w*|found\w*|set\s+up|maintain\w*|run\w*|"
         r"own\w*|open\w*|base\w*|"
@@ -707,13 +732,13 @@ def _primary_tie_assertion(text: str) -> bool:
     )
 
 
-def _independent_primary_confirmations(evidence: list[dict]) -> list[dict]:
-    """Count distinct primary-source domains with an Israel/relationship passage."""
+def _independent_primary_confirmations(evidence: list[dict], company: str = "") -> list[dict]:
+    """SEC hosts issuer statements: it is not an independent second publisher."""
     by_domain: dict[str, dict] = {}
     for item in evidence:
         if item.get("source_class") not in PRIMARY_SOURCE_CLASSES:
             continue
-        if not item.get("candidate") or not _primary_tie_assertion(item.get("text", "")):
+        if not item.get("candidate") or not _primary_tie_assertion(item.get("text", ""), company):
             continue
         url = str(item.get("source_url", ""))
         parsed = urlparse(url)
@@ -722,8 +747,10 @@ def _independent_primary_confirmations(evidence: list[dict]) -> list[dict]:
         domain = parsed.hostname.casefold().removeprefix("www.")
         if not domain:
             continue
-        by_domain.setdefault(domain, {
+        # Both configured source classes are authored by the analyzed company.
+        by_domain.setdefault("company-disclosures", {
             "domain": domain,
+            "publisher": company or "Azienda analizzata",
             "source_class": item["source_class"],
             "description": item.get("description", "Fonte primaria consultata"),
             "source_url": url,
@@ -743,7 +770,7 @@ def analyze_company(
         sec_status = "consultata"
         try:
             metadata, filings = _recent_filings(cik)
-        except (HTTPError, URLError, TimeoutError, ValueError):
+        except (RuntimeError, HTTPError, URLError, OSError, ValueError):
             metadata, filings = {"name": company, "tickers": []}, []
             sec_status = "non disponibile"
     else:
@@ -830,7 +857,8 @@ def analyze_company(
     evidence.sort(key=lambda item: (item["candidate"], item.get("date", "")), reverse=True)
     initial_research = get_initial_signal(company_name)
     initial_signal = initial_research["signal"]
-    alternatives = get_alternatives(company_name, country_code, entity_id)
+    # Publish the report and curated results before optional remote discovery.
+    alternatives = get_alternatives(company_name, country_code, entity_id, include_automatic=False)
     signal_document = {
         "form": "Segnalazione iniziale",
         "date": initial_signal.get("source_updated_at", ""),
@@ -851,12 +879,12 @@ def analyze_company(
         {"source": "CSV TechForPalestine (fallback)", "status": initial_research["providers"][1].get("status", "non consultato")},
     ]
 
-    primary_confirmations = _independent_primary_confirmations(evidence)
+    primary_confirmations = _independent_primary_confirmations(evidence, company_name)
     if primary_confirmations:
         verdict = "Relazione documentata da fonte primaria"
         explanation = (
             f"Almeno una fonte primaria consultata contiene un passaggio pertinente. "
-            f"Sono stati individuati {len(primary_confirmations)} domini primari distinti; "
+            f"Sono stati individuati {len(primary_confirmations)} autori primari distinti; "
             "la lista iniziale resta una segnalazione e non determina il verdetto. Apri le citazioni "
             "per controllare contesto, data e natura del rapporto."
         )
@@ -896,7 +924,7 @@ def analyze_company(
         if confirmation_count == 0 else
         "Una fonte primaria · affidabilità limitata"
         if confirmation_count == 1 else
-        f"{confirmation_count} domini primari distinti"
+        f"{confirmation_count} autori primari distinti"
     )
     return {
         "company": company_name,
@@ -917,7 +945,7 @@ def analyze_company(
         "reliability": {
             "independent_primary_count": confirmation_count,
             "label": reliability_label,
-            "note": "Domini distinti usati come proxy di indipendenza; eventuali proprietari comuni non sono deduplicati. Non è una probabilità.",
+            "note": "Filing SEC e pagine ufficiali della stessa azienda contano come un solo autore. Sono dichiarazioni aziendali, non corroborazioni indipendenti esterne. Non è una probabilità.",
         },
         "source_count": len(documents),
         "evidence_count": len(evidence),
@@ -939,7 +967,7 @@ def analyze_company(
             f"degli ultimi 3 mesi e snippet degli ultimi 3 giorni (massimo {MAX_NEWS_RESULTS} ciascuno). "
             "La lista Boycott Israel e il CSV TechForPalestine sono solo fonti di segnalazioni: "
             "non determinano il verdetto. Un risultato positivo richiede un passaggio pertinente "
-            "in almeno una fonte primaria; le conferme sono contate per dominio distinto. "
+            "in almeno una fonte primaria; i filing e le pagine della stessa azienda contano come un solo autore. "
             "Wikidata aiuta a identificare candidati, non è un registro completo di tutte le aziende. "
             "Le opzioni automatiche sono peer candidati basati su settore e paese Wikidata, ordinati con BM25; non dimostrano disponibilità commerciale né assenza di rapporti. "
             "La copertura varia per società e l’assenza di risultati non prova l’assenza di rapporti."
@@ -952,29 +980,67 @@ def analyze_company(
 def _authorized() -> bool:
     if not APP_ACCESS_KEY:
         return True
-    return request.headers.get("X-Access-Key", "") == APP_ACCESS_KEY
+    return hmac.compare_digest(request.headers.get("X-Access-Key", "").encode(), APP_ACCESS_KEY.encode())
 
 
 def _rate_limited(limit: int, window_seconds: int) -> bool:
-    now = time.time()
-    key = request.remote_addr or "unknown"
+    now = time.monotonic()
+    key = (request.endpoint or request.path, request.remote_addr or "unknown")
     with _rate_lock:
+        # Keep independent windows; a company search must neither consume nor
+        # erase the hourly analysis quota. Bound memory even for many clients.
+        if key not in _request_counts and len(_request_counts) >= 2048:
+            for stale_key, stamps in list(_request_counts.items()):
+                if not stamps or now - stamps[-1] >= 3600:
+                    _request_counts.pop(stale_key, None)
+            if len(_request_counts) >= 2048:
+                return True
         attempts = [stamp for stamp in _request_counts.get(key, []) if now - stamp < window_seconds]
         if len(attempts) >= limit:
             _request_counts[key] = attempts
             return True
         attempts.append(now)
         _request_counts[key] = attempts
-        if len(_request_counts) > 2048:
-            for stale_key, stamps in list(_request_counts.items()):
-                fresh = [stamp for stamp in stamps if now - stamp < 3600]
-                if fresh:
-                    _request_counts[stale_key] = fresh
-                else:
-                    _request_counts.pop(stale_key, None)
-                if len(_request_counts) <= 1024:
-                    break
         return False
+
+
+def _research_payload() -> dict:
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ValueError("Invia un oggetto JSON valido.")
+    fields = {}
+    for key, default, max_length in (
+        ("company", "", 160), ("entity_id", "", 16),
+        ("country_code", "IT", 2), ("cik", "", 10),
+    ):
+        value = payload.get(key, default)
+        if not isinstance(value, str) or len(value.strip()) > max_length:
+            raise ValueError(f"Campo {key} non valido.")
+        fields[key] = value.strip()
+    if len(fields["company"]) < 2:
+        raise ValueError("Inserisci un nome aziendale di almeno due caratteri.")
+    fields["country_code"] = fields["country_code"].upper()
+    if fields["country_code"] not in COUNTRIES:
+        raise ValueError("Seleziona un paese disponibile nel menu.")
+    fields["entity_id"] = fields["entity_id"].upper()
+    if fields["entity_id"] and not re.fullmatch(r"Q[1-9]\d*", fields["entity_id"]):
+        raise ValueError("Identificativo Wikidata non valido.")
+    if fields["cik"]:
+        if not re.fullmatch(r"[0-9]{1,10}", fields["cik"]):
+            raise ValueError("CIK non valido.")
+        fields["cik"] = fields["cik"].zfill(10)
+    return fields
+
+
+@app.errorhandler(Exception)
+def handle_error(error):
+    if isinstance(error, HTTPException):
+        if request.path.startswith("/api/"):
+            messages = {413: "Richiesta troppo grande.", 404: "Endpoint non trovato.", 405: "Metodo non consentito."}
+            return jsonify({"error": messages.get(error.code, "Richiesta non valida.")}), error.code
+        return error
+    app.logger.exception("Richiesta non completata")
+    return jsonify({"error": "Il servizio non ha completato la richiesta. Riprova tra poco."}), 500
 
 
 @app.after_request
@@ -982,6 +1048,8 @@ def security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; style-src 'self'; script-src 'self'; "
         "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
@@ -1021,10 +1089,8 @@ def companies():
         # Keep name-based search available when SEC is unavailable or the company
         # is not a SEC filer; the analyst can choose a Wikidata or manual match.
         sec_results = []
-    if sec_results:
-        return jsonify({"results": sec_results, "manual_name": ""})
     entity_results = find_wikidata_entities(query.strip())
-    return jsonify({"results": entity_results, "manual_name": query.strip()})
+    return jsonify({"results": sec_results + entity_results, "manual_name": query.strip()})
 
 
 @app.post("/api/alternatives")
@@ -1032,19 +1098,18 @@ def alternatives():
     """Refresh country-specific suggestions without rerunning company research."""
     if not _authorized():
         return jsonify({"error": "Chiave di accesso non valida."}), 401
-    if _rate_limited(30, 60):
-        return jsonify({"error": "Troppe richieste. Attendi un minuto."}), 429
-    payload = request.get_json(silent=True) or {}
-    company = str(payload.get("company", ""))[:160].strip()
-    entity_id = str(payload.get("entity_id", ""))[:16].strip().upper()
-    if entity_id and not re.fullmatch(r"Q[1-9]\d*", entity_id):
-        entity_id = ""
-    country_code = str(payload.get("country_code", "IT")).upper()[:2]
-    if not company:
-        return jsonify({"error": "Manca il nome dell’azienda."}), 400
-    if country_code not in COUNTRIES:
-        return jsonify({"error": "Seleziona un paese disponibile nel menu."}), 400
-    return jsonify(get_alternatives(company, country_code, entity_id))
+    try:
+        payload = _research_payload()
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    if not _alternatives_lock.acquire(blocking=False):
+        return jsonify({"error": "Ricerca delle alternative già in corso. Riprova tra poco."}), 429
+    try:
+        if _rate_limited(30, 60):
+            return jsonify({"error": "Troppe richieste. Attendi un minuto."}), 429
+        return jsonify(get_alternatives(payload["company"], payload["country_code"], payload["entity_id"]))
+    finally:
+        _alternatives_lock.release()
 
 
 @app.post("/api/analyze")
@@ -1052,24 +1117,16 @@ def analyze():
     global _embedder, _spacy_nlp, _spacy_checked
     if not _authorized():
         return jsonify({"error": "Chiave di accesso non valida."}), 401
-    if _rate_limited(6, 3600):
-        return jsonify({"error": "Limite gratuito: massimo 6 analisi per ora da questo indirizzo."}), 429
-    payload = request.get_json(silent=True) or {}
-    company = str(payload.get("company", ""))[:160].strip()
-    raw_cik = str(payload.get("cik", ""))[:10].strip()
-    cik = raw_cik.zfill(10) if raw_cik.isdigit() and raw_cik else ""
-    entity_id = str(payload.get("entity_id", ""))[:16].strip().upper()
-    if entity_id and not re.fullmatch(r"Q[1-9]\d*", entity_id):
-        entity_id = ""
-    if not company:
-        return jsonify({"error": "Inserisci o seleziona il nome di un’azienda."}), 400
+    try:
+        payload = _research_payload()
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
     if not _analysis_lock.acquire(blocking=False):
         return jsonify({"error": "Un’analisi è già in corso. Riprova tra poco."}), 429
     try:
-        country_code = str(payload.get("country_code", "IT")).upper()[:2]
-        if country_code not in COUNTRIES:
-            return jsonify({"error": "Seleziona un paese disponibile nel menu."}), 400
-        result = analyze_company(company, cik, entity_id, country_code)
+        if _rate_limited(6, 3600):
+            return jsonify({"error": "Limite gratuito: massimo 6 analisi per ora da questo indirizzo."}), 429
+        result = analyze_company(**payload)
         return jsonify(result)
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 503
@@ -1081,13 +1138,13 @@ def analyze():
         app.logger.exception("Analisi fallita")
         return jsonify({"error": "Analisi non completata. Riprova più tardi."}), 500
     finally:
-        _analysis_lock.release()
         # Drop model references; gc is best-effort because native runtimes may
         # keep memory arenas resident until the process exits.
         _embedder = None
         _spacy_nlp = None
         _spacy_checked = False
         gc.collect()
+        _analysis_lock.release()
 
 
 if __name__ == "__main__":

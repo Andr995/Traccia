@@ -180,3 +180,4 @@ input:focus, select:focus { border-color: var(--blue-strong); box-shadow: 0 0 0 
   :root { color-scheme: light; --bg: #fff; --surface: #fff; --surface-raised: #f7f8fa; --surface-soft: #fff; --line: #d8dee5; --line-soft: #e6e9ed; --text: #17212f; --muted: #506176; --subtle: #6e7c8b; }
   body { background: #fff; }.topbar, .search-pane, .footer, .report-actions { display: none !important; }.shell { width: 100%; }.workspace { display: block; border: 0; box-shadow: none; }.report-pane { padding: 0; }.report:not(.hidden) { display: block !important; }.evidence-item, .methodology { break-inside: avoid; }.evidence-item:not([open]) .evidence-body { display: block; }.evidence-item summary { cursor: default; }
 }
+.alternatives-progress { color: var(--blue); font-size: 12px; padding: 12px 0; }

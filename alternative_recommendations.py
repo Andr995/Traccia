@@ -1,11 +1,9 @@
-"""Curated, source-linked alternatives; absence from signal lists is not clearance."""
+"""Curated and discovered candidates; absence from signal lists is not clearance."""
 
 from __future__ import annotations
 
-import re
-import unicodedata
-
-from signal_sources import get_initial_signal
+from company_identity import company_key as _company_key, normalize_name as _normalize
+from signal_sources import screen_names
 from automatic_alternatives import get_automatic_alternatives
 
 
@@ -30,6 +28,8 @@ ALTERNATIVES = [
         },
         "country_code": "IT",
         "brand": "Tomarchio",
+        "comparison_category": "Q134041",  # Cola: https://www.wikidata.org/wiki/Q134041
+        "screening_names": ["Tomarchio", "Sibat Tomarchio"],
         "product": "Cola",
         "origin": "Italia · Acireale, Sicilia",
         "description": "Bibita cola prodotta e confezionata da Sibat Tomarchio S.r.l.",
@@ -43,6 +43,7 @@ ALTERNATIVES = [
         },
         "country_code": "IT",
         "brand": "Molecola",
+        "comparison_category": "Q134041",
         "product": "Classica",
         "origin": "Italia · Torino / produzione e imbottigliamento in Italia",
         "description": "Il produttore presenta Molecola Classica come cola italiana e dichiara produzione e imbottigliamento in Italia.",
@@ -56,6 +57,7 @@ ALTERNATIVES = [
         },
         "country_code": "IT",
         "brand": "Novi",
+        "screening_names": ["Novi", "Elah Dufour Novi"],
         "product": "Cioccolato Novi",
         "origin": "Italia · Novi Ligure / Genova",
         "description": "Il gruppo Elah Dufour Novi indica Novi tra i propri marchi di cioccolato e dichiara che i suoi stabilimenti sono in Italia.",
@@ -78,27 +80,11 @@ ALTERNATIVES = [
 ]
 
 
-def _normalize(value: str) -> str:
-    folded = unicodedata.normalize("NFKD", str(value or "").casefold())
-    ascii_value = folded.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", " ", ascii_value).strip()
-
-
-def _company_key(value: str) -> str:
-    words = _normalize(value).split()
-    while words and words[0] == "the":
-        words.pop(0)
-    while words and words[-1] in {
-        "inc", "incorporated", "corp", "corporation", "company", "co",
-        "plc", "ltd", "limited", "llc", "llp", "sa", "nv", "ag",
-    }:
-        words.pop()
-    return " ".join(words)
-
-
-def get_alternatives(company: str, country_code: str, entity_id: str = "") -> dict:
+def get_alternatives(company: str, country_code: str, entity_id: str = "", *, include_automatic: bool = True) -> dict:
     """Return curated alternatives and automatically discovered local industry peers."""
     code = str(country_code or "IT").upper()
+    if code not in COUNTRIES:
+        raise ValueError("Paese non supportato.")
     normalized = {_normalize(company), _company_key(company)} - {""}
     matches = []
     for item in ALTERNATIVES:
@@ -114,14 +100,13 @@ def get_alternatives(company: str, country_code: str, entity_id: str = "") -> di
     items = []
     excluded_count = 0
     for item in country_matches:
-        screening = get_initial_signal(item["brand"])
+        names = item.get("screening_names", [item["brand"]])
+        screening = screen_names(names)
         if screening.get("matched"):
             excluded_count += 1
             continue
         providers = screening.get("providers", [])
-        both_lists_checked = len(providers) >= 2 and all(
-            bool(provider.get("available")) for provider in providers
-        )
+        both_lists_checked = screening["complete"]
         items.append({
             "brand": item["brand"],
             "product": item["product"],
@@ -129,24 +114,21 @@ def get_alternatives(company: str, country_code: str, entity_id: str = "") -> di
             "description": item["description"],
             "product_url": item["product_url"],
             "source_label": item["source_label"],
+            "ownership_note": "Nomi controllati: " + ", ".join(names) + ". Struttura societaria completa non verificata.",
             "screening_status": (
                 "Nessuna segnalazione trovata nelle liste consultate; questo non esclude altri legami."
                 if both_lists_checked else
                 "Screening delle liste incompleto; legami non verificati."
             ),
             "screening_complete": both_lists_checked,
-            "screening_sources": [
-                {"source": provider.get("source", "Fonte lista"),
-                 "source_url": provider.get("source_url", ""),
-                 "status": provider.get("status", "non disponibile")}
-                for provider in providers
-            ],
+            "screening_sources": providers,
         })
 
     curated_count = len(items)
     automatic = get_automatic_alternatives(
-        company, code, entity_id, limit=max(0, 5 - curated_count)
-    )
+        company, code, entity_id, limit=max(0, 5 - curated_count),
+        category_ids=tuple(dict.fromkeys(item["comparison_category"] for item in matches if item.get("comparison_category"))),
+    ) if include_automatic else {"items": [], "status": "Ricerca automatica in attesa", "pending": True}
     seen_brands = {_normalize(item["brand"]) for item in items}
     for candidate in automatic.get("items", []):
         brand_key = _normalize(candidate["brand"])
@@ -165,6 +147,11 @@ def get_alternatives(company: str, country_code: str, entity_id: str = "") -> di
         "excluded_count": excluded_count + automatic.get("excluded_count", 0),
         "automatic_status": automatic.get("status", "ricerca automatica non disponibile"),
         "automatic_entity_url": automatic.get("entity_url", ""),
+        "automatic_profile_url": automatic.get("profile_url", ""),
+        "automatic_profile_name": automatic.get("profile_name", ""),
+        "automatic_retrieved_at": automatic.get("retrieved_at", ""),
+        "pending": bool(automatic.get("pending")),
+        "retryable": bool(automatic.get("retryable")),
         "catalog_note": (
             "Le schede ufficiali documentano prodotto o sito dell’impresa; Wikidata e BM25 aiutano a individuare aziende della stessa categoria. "
             "Sono candidati da controllare, non aziende certificate senza rapporti con Israele. Il controllo delle liste è limitato e non equivale a una verifica completa dei legami societari."
