@@ -180,17 +180,18 @@
 
   function renderAlternatives(result) {
     const data = result.alternatives || {};
-    if (!data.applicable) return `<section id="alternatives-panel" class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI</p><h3>Alternative per ${escapeHtml(data.country_name || result.country_name || "il paese selezionato")}</h3></div></div><p class="alternatives-empty">Il catalogo non contiene ancora opzioni documentate per questo marchio e paese. L’assenza di suggerimenti non indica che non esistano.</p><p class="alternatives-disclaimer">Quando disponibili, le fonti documentano prodotto e provenienza dichiarata; non certificano l’assenza di rapporti.</p></section>`;
+    if (!data.applicable) return `<section id="alternatives-panel" class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI · ${escapeHtml(data.country_name || result.country_name || "")}</p><h3>Alternative a ${escapeHtml(data.target || result.company)}</h3></div></div><p class="alternatives-empty">Non ho trovato candidati documentati per questo marchio e paese. ${escapeHtml(data.automatic_status || "La ricerca automatica non ha restituito corrispondenze utilizzabili.")}</p><p class="alternatives-disclaimer">L’assenza di suggerimenti non indica che non esistano alternative; dati incompleti o assenti in Wikidata possono limitare il confronto.</p></section>`;
     const entries = (data.items || []).map((item) => {
       const screeningSources = (item.screening_sources || []).map((source) => `<li><span>${escapeHtml(source.source)} · ${escapeHtml(source.status)}</span>${/^https:\/\//i.test(source.source_url) ? `<a href="${escapeHtml(source.source_url)}" target="_blank" rel="noopener noreferrer">Apri ↗</a>` : ""}</li>`).join("");
-      return `<article class="alternative-item"><div class="alternative-topline"><div><p class="eyebrow">${escapeHtml(item.origin)}</p><h4>${escapeHtml(item.brand)} <span>· ${escapeHtml(item.product)}</span></h4></div><span class="alternative-status">${item.screening_complete ? "Liste consultate" : "Screening incompleto"}</span></div>
+      return `<article class="alternative-item"><div class="alternative-topline"><div><p class="eyebrow">${escapeHtml(item.automatic ? "CONFRONTO AUTOMATICO · " : "SELEZIONE CURATA · ")}${escapeHtml(item.origin)}</p><h4>${escapeHtml(item.brand)} <span>· ${escapeHtml(item.product)}</span></h4></div><span class="alternative-status">${item.screening_complete ? "Liste consultate" : "Screening incompleto"}</span></div>
         <p class="alternative-description">${escapeHtml(item.description)}</p><div class="alternative-links"><a href="${escapeHtml(item.product_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.source_label)} ↗</a></div>
+        ${item.category_url ? `<div class="alternative-links"><a href="${escapeHtml(item.category_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.category_label || "Verifica settore e paese su Wikidata")} ↗</a><span class="alternative-caveat">BM25 ordina le descrizioni simili; non è una probabilità né un’approvazione.</span></div>` : ""}
         <p class="alternative-caveat">${escapeHtml(item.screening_status)}</p>${screeningSources ? `<details class="alternative-sources"><summary>Fonti usate per il controllo</summary><ul>${screeningSources}</ul></details>` : ""}
       </article>`;
     }).join("");
     return `<section id="alternatives-panel" class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI · ${escapeHtml(data.country_name || result.country_name || "")}</p><h3>Alternative a ${escapeHtml(data.target || result.company)}</h3></div><span class="source-count">${(data.items || []).length} suggerimenti</span></div>
       ${entries || `<p class="alternatives-empty">Non ci sono ancora alternative documentate per ${escapeHtml(data.country_name || result.country_name || "il paese selezionato")}.</p>`}
-      ${data.excluded_count ? `<p class="alternative-caveat">${data.excluded_count} candidato/i escluso/i perché presente/i in una lista di segnalazione.</p>` : ""}<p class="alternatives-disclaimer">${escapeHtml(data.catalog_note || "Il catalogo è parziale; una ricerca senza segnalazioni non dimostra l’assenza di legami.")}</p>
+      ${data.excluded_count ? `<p class="alternative-caveat">${data.excluded_count} candidato/i escluso/i perché presente/i in una lista di segnalazione.</p>` : ""}<p class="alternatives-disclaimer">Ricerca automatica: ${escapeHtml(data.automatic_status || "nessun dato automatico disponibile")} · Le aziende sono confrontate tramite settore e paese su Wikidata, poi ordinate con BM25 sui nomi e sulle descrizioni. ${escapeHtml(data.catalog_note || "Le corrispondenze sono candidati da controllare, non aziende certificate senza rapporti.")}</p>
     </section>`;
   }
 
@@ -232,7 +233,7 @@
       const response = await fetch("/api/alternatives", {
         method: "POST",
         headers: apiHeaders(true),
-        body: JSON.stringify({ company: state.result.company, country_code: countryCode }),
+        body: JSON.stringify({ company: state.result.company, entity_id: state.result.entity_id || "", country_code: countryCode }),
       });
       const payload = await readApiResponse(response);
       if (requestId !== alternativesRequest || !state.result) return;

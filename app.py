@@ -41,7 +41,7 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 APP_ACCESS_KEY = os.environ.get("APP_ACCESS_KEY", "")
-ASSET_VERSION = "6"
+ASSET_VERSION = "7"
 
 _analysis_lock = threading.Lock()
 _sec_lock = threading.Lock()
@@ -830,7 +830,7 @@ def analyze_company(
     evidence.sort(key=lambda item: (item["candidate"], item.get("date", "")), reverse=True)
     initial_research = get_initial_signal(company_name)
     initial_signal = initial_research["signal"]
-    alternatives = get_alternatives(company_name, country_code)
+    alternatives = get_alternatives(company_name, country_code, entity_id)
     signal_document = {
         "form": "Segnalazione iniziale",
         "date": initial_signal.get("source_updated_at", ""),
@@ -941,6 +941,7 @@ def analyze_company(
             "non determinano il verdetto. Un risultato positivo richiede un passaggio pertinente "
             "in almeno una fonte primaria; le conferme sono contate per dominio distinto. "
             "Wikidata aiuta a identificare candidati, non è un registro completo di tutte le aziende. "
+            "Le opzioni automatiche sono peer candidati basati su settore e paese Wikidata, ordinati con BM25; non dimostrano disponibilità commerciale né assenza di rapporti. "
             "La copertura varia per società e l’assenza di risultati non prova l’assenza di rapporti."
         ),
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1035,12 +1036,15 @@ def alternatives():
         return jsonify({"error": "Troppe richieste. Attendi un minuto."}), 429
     payload = request.get_json(silent=True) or {}
     company = str(payload.get("company", ""))[:160].strip()
+    entity_id = str(payload.get("entity_id", ""))[:16].strip().upper()
+    if entity_id and not re.fullmatch(r"Q[1-9]\d*", entity_id):
+        entity_id = ""
     country_code = str(payload.get("country_code", "IT")).upper()[:2]
     if not company:
         return jsonify({"error": "Manca il nome dell’azienda."}), 400
     if country_code not in COUNTRIES:
         return jsonify({"error": "Seleziona un paese disponibile nel menu."}), 400
-    return jsonify(get_alternatives(company, country_code))
+    return jsonify(get_alternatives(company, country_code, entity_id))
 
 
 @app.post("/api/analyze")

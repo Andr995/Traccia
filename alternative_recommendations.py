@@ -6,6 +6,7 @@ import re
 import unicodedata
 
 from signal_sources import get_initial_signal
+from automatic_alternatives import get_automatic_alternatives
 
 
 COUNTRIES = {
@@ -95,8 +96,8 @@ def _company_key(value: str) -> str:
     return " ".join(words)
 
 
-def get_alternatives(company: str, country_code: str) -> dict:
-    """Return country-matched suggestions with product and signal-list provenance."""
+def get_alternatives(company: str, country_code: str, entity_id: str = "") -> dict:
+    """Return curated alternatives and automatically discovered local industry peers."""
     code = str(country_code or "IT").upper()
     normalized = {_normalize(company), _company_key(company)} - {""}
     matches = []
@@ -109,17 +110,6 @@ def get_alternatives(company: str, country_code: str) -> dict:
         }
         if normalized.intersection(aliases):
             matches.append(item)
-    if not matches:
-        return {
-            "applicable": False,
-            "country_code": code,
-            "country_name": COUNTRIES.get(code, "Paese selezionato"),
-            "target": company,
-            "items": [],
-            "excluded_count": 0,
-            "catalog_note": "Il catalogo è curato e parziale; un abbinamento assente non significa che non esistano alternative.",
-        }
-
     country_matches = [item for item in matches if item["country_code"] == code]
     items = []
     excluded_count = 0
@@ -153,15 +143,30 @@ def get_alternatives(company: str, country_code: str) -> dict:
             ],
         })
 
+    curated_count = len(items)
+    automatic = get_automatic_alternatives(
+        company, code, entity_id, limit=max(0, 5 - curated_count)
+    )
+    seen_brands = {_normalize(item["brand"]) for item in items}
+    for candidate in automatic.get("items", []):
+        brand_key = _normalize(candidate["brand"])
+        if brand_key and brand_key not in seen_brands:
+            items.append(candidate)
+            seen_brands.add(brand_key)
+
+    applicable = bool(matches or items)
+
     return {
-        "applicable": True,
+        "applicable": applicable,
         "country_code": code,
         "country_name": COUNTRIES.get(code, "Paese selezionato"),
         "target": company,
         "items": items,
-        "excluded_count": excluded_count,
+        "excluded_count": excluded_count + automatic.get("excluded_count", 0),
+        "automatic_status": automatic.get("status", "ricerca automatica non disponibile"),
+        "automatic_entity_url": automatic.get("entity_url", ""),
         "catalog_note": (
-            "Le fonti ufficiali documentano prodotto e provenienza dichiarata, non l’assenza di rapporti con Israele. "
-            "Il controllo delle liste è limitato e non equivale a una verifica completa dei legami societari."
+            "Le schede ufficiali documentano prodotto o sito dell’impresa; Wikidata e BM25 aiutano a individuare aziende della stessa categoria. "
+            "Sono candidati da controllare, non aziende certificate senza rapporti con Israele. Il controllo delle liste è limitato e non equivale a una verifica completa dei legami societari."
         ),
     }
