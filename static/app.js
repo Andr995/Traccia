@@ -3,6 +3,7 @@
   const state = { selected: null, lastQuery: "", result: null, busy: false };
   const keyRequired = document.body.dataset.accessKeyRequired === "true";
   const historyKey = "traccia.reports.v2";
+  let alternativesRequest = 0;
 
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -179,15 +180,15 @@
 
   function renderAlternatives(result) {
     const data = result.alternatives || {};
-    if (!data.applicable) return `<section class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI</p><h3>Alternative per ${escapeHtml(result.country_name || "il paese selezionato")}</h3></div></div><p class="alternatives-empty">Il catalogo non contiene ancora alternative documentate per questo marchio. L’assenza di suggerimenti non indica che non esistano.</p></section>`;
+    if (!data.applicable) return `<section id="alternatives-panel" class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI</p><h3>Alternative per ${escapeHtml(data.country_name || result.country_name || "il paese selezionato")}</h3></div></div><p class="alternatives-empty">Il catalogo non contiene ancora opzioni documentate per questo marchio e paese. L’assenza di suggerimenti non indica che non esistano.</p><p class="alternatives-disclaimer">Quando disponibili, le fonti documentano prodotto e provenienza dichiarata; non certificano l’assenza di rapporti.</p></section>`;
     const entries = (data.items || []).map((item) => {
       const screeningSources = (item.screening_sources || []).map((source) => `<li><span>${escapeHtml(source.source)} · ${escapeHtml(source.status)}</span>${/^https:\/\//i.test(source.source_url) ? `<a href="${escapeHtml(source.source_url)}" target="_blank" rel="noopener noreferrer">Apri ↗</a>` : ""}</li>`).join("");
-      return `<article class="alternative-item"><div class="alternative-topline"><div><p class="eyebrow">${escapeHtml(item.origin)}</p><h4>${escapeHtml(item.brand)} <span>· ${escapeHtml(item.product)}</span></h4></div><span class="alternative-status">${item.screening_complete ? "Nessuna segnalazione nelle liste" : "Screening incompleto"}</span></div>
+      return `<article class="alternative-item"><div class="alternative-topline"><div><p class="eyebrow">${escapeHtml(item.origin)}</p><h4>${escapeHtml(item.brand)} <span>· ${escapeHtml(item.product)}</span></h4></div><span class="alternative-status">${item.screening_complete ? "Liste consultate" : "Screening incompleto"}</span></div>
         <p class="alternative-description">${escapeHtml(item.description)}</p><div class="alternative-links"><a href="${escapeHtml(item.product_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.source_label)} ↗</a></div>
         <p class="alternative-caveat">${escapeHtml(item.screening_status)}</p>${screeningSources ? `<details class="alternative-sources"><summary>Fonti usate per il controllo</summary><ul>${screeningSources}</ul></details>` : ""}
       </article>`;
     }).join("");
-    return `<section class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI · ${escapeHtml(data.country_name || result.country_name || "")}</p><h3>Alternative a ${escapeHtml(data.target || result.company)}</h3></div><span class="source-count">${(data.items || []).length} suggerimenti</span></div>
+    return `<section id="alternatives-panel" class="alternatives-section"><div class="alternatives-heading"><div><p class="eyebrow">OPZIONI LOCALI · ${escapeHtml(data.country_name || result.country_name || "")}</p><h3>Alternative a ${escapeHtml(data.target || result.company)}</h3></div><span class="source-count">${(data.items || []).length} suggerimenti</span></div>
       ${entries || `<p class="alternatives-empty">Non ci sono ancora alternative documentate per ${escapeHtml(data.country_name || result.country_name || "il paese selezionato")}.</p>`}
       ${data.excluded_count ? `<p class="alternative-caveat">${data.excluded_count} candidato/i escluso/i perché presente/i in una lista di segnalazione.</p>` : ""}<p class="alternatives-disclaimer">${escapeHtml(data.catalog_note || "Il catalogo è parziale; una ricerca senza segnalazioni non dimostra l’assenza di legami.")}</p>
     </section>`;
@@ -204,9 +205,9 @@
     $("#report").innerHTML = `<div class="report-topline"><span class="eyebrow">DOSSIER ${escapeHtml(result.report_id)}</span><div class="report-actions"><button id="export-report" class="text-button" type="button">Esporta JSON ↓</button><button id="print-report" class="text-button" type="button">Stampa</button></div></div>
       <div class="company-title"><div><h2>${escapeHtml(result.company)}</h2><p>${result.cik ? `${escapeHtml(result.ticker || "Emittente SEC")} · CIK ${escapeHtml(result.cik)}` : `${escapeHtml(result.identity_source || "Nome inserito")}${result.entity_id ? ` · ${escapeHtml(result.entity_id)}` : " · identità da verificare"}`}</p></div><span class="scope-chip">${docs.length} fonti</span></div>
       <section class="verdict-block ${tone}"><div class="verdict-symbol" aria-hidden="true">${tone === "amber" ? "!" : tone === "green" ? "✓" : "·"}</div><div class="verdict-content"><p class="eyebrow">VERDETTO</p><h1>${escapeHtml(result.verdict)}</h1><p>${escapeHtml(result.explanation)}</p></div></section>
+      ${renderAlternatives(result)}
       ${renderReliability(result)}
       ${result.initial_signal ? renderInitialSignal(result.initial_signal) : ""}
-      ${renderAlternatives(result)}
       <section class="confidence-row" aria-label="Indicatore di pertinenza delle evidenze"><div class="confidence-copy"><span class="eyebrow">QUALITÀ DEL RECUPERO</span><strong>${escapeHtml(result.confidence)}<small>/100</small></strong><span class="confidence-label">${confidenceLabel(result.confidence)}</span></div><progress class="confidence-meter" max="100" value="${Math.max(0, Math.min(100, result.confidence))}" aria-label="Punteggio di pertinenza"></progress><p class="confidence-note">${escapeHtml(result.confidence_label)} · Euristica da calibrare, non probabilità di legame.</p></section>
       <section class="reasoning"><p class="eyebrow">LETTURA DEL SISTEMA</p><p>${escapeHtml(result.explanation)}</p><div class="method-tags"><span>${escapeHtml(faissState)}</span><span>Entità NER negli estratti: ${entityCount}</span><span>${result.retrieval?.official_profile ? "Profilo ufficiale consultato" : "Profilo ufficiale non configurato"}</span><span>${result.retrieval?.gdelt_context ? "GDELT consultato" : "GDELT non disponibile"}</span></div></section>
       <section class="sources-section"><div class="sources-heading"><div><p class="eyebrow">EVIDENZE E CITAZIONI</p><h3>${evidence.length} passaggi da esaminare</h3></div><span class="source-count">${docs.length} fonti consultate</span></div><div class="evidence-list">${renderEvidence(evidence)}</div>
@@ -217,6 +218,41 @@
     $("#export-report").addEventListener("click", () => exportReport(result));
     $("#print-report").addEventListener("click", () => window.print());
     saveHistory(result);
+  }
+
+  async function refreshAlternatives() {
+    if (!state.result || state.busy) return;
+    const panel = $("#alternatives-panel");
+    if (!panel) return;
+    const requestId = ++alternativesRequest;
+    const countryCode = $("#country-select").value;
+    panel.setAttribute("aria-busy", "true");
+    panel.innerHTML = `<p class="alternatives-empty" role="status">Aggiorno le opzioni per ${escapeHtml(countrySelectLabel(countryCode))}…</p>`;
+    try {
+      const response = await fetch("/api/alternatives", {
+        method: "POST",
+        headers: apiHeaders(true),
+        body: JSON.stringify({ company: state.result.company, country_code: countryCode }),
+      });
+      const payload = await readApiResponse(response);
+      if (requestId !== alternativesRequest || !state.result) return;
+      state.result.alternatives = payload;
+      state.result.country_code = countryCode;
+      state.result.country_name = payload.country_name;
+      const replacement = document.createElement("div");
+      replacement.innerHTML = renderAlternatives(state.result);
+      panel.replaceWith(replacement.firstElementChild);
+      saveHistory(state.result);
+    } catch (error) {
+      if (requestId !== alternativesRequest) return;
+      panel.removeAttribute("aria-busy");
+      panel.innerHTML = `<p class="alternatives-empty" role="status">Non riesco ad aggiornare le opzioni: ${escapeHtml(error.message)}. Riprova cambiando di nuovo il paese.</p>`;
+    }
+  }
+
+  function countrySelectLabel(code) {
+    const option = Array.from($("#country-select").options).find((item) => item.value === code);
+    return option?.textContent || "paese selezionato";
   }
 
   async function runAnalysis() {
@@ -301,6 +337,7 @@
   countrySelect.value = preferredCountry;
   countrySelect.addEventListener("change", () => {
     try { localStorage.setItem("traccia.country", countrySelect.value); } catch {}
+    refreshAlternatives();
   });
   $("#theme-toggle").addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";

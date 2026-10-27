@@ -41,7 +41,7 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 APP_ACCESS_KEY = os.environ.get("APP_ACCESS_KEY", "")
-ASSET_VERSION = "5"
+ASSET_VERSION = "6"
 
 _analysis_lock = threading.Lock()
 _sec_lock = threading.Lock()
@@ -1024,6 +1024,23 @@ def companies():
         return jsonify({"results": sec_results, "manual_name": ""})
     entity_results = find_wikidata_entities(query.strip())
     return jsonify({"results": entity_results, "manual_name": query.strip()})
+
+
+@app.post("/api/alternatives")
+def alternatives():
+    """Refresh country-specific suggestions without rerunning company research."""
+    if not _authorized():
+        return jsonify({"error": "Chiave di accesso non valida."}), 401
+    if _rate_limited(30, 60):
+        return jsonify({"error": "Troppe richieste. Attendi un minuto."}), 429
+    payload = request.get_json(silent=True) or {}
+    company = str(payload.get("company", ""))[:160].strip()
+    country_code = str(payload.get("country_code", "IT")).upper()[:2]
+    if not company:
+        return jsonify({"error": "Manca il nome dell’azienda."}), 400
+    if country_code not in COUNTRIES:
+        return jsonify({"error": "Seleziona un paese disponibile nel menu."}), 400
+    return jsonify(get_alternatives(company, country_code))
 
 
 @app.post("/api/analyze")

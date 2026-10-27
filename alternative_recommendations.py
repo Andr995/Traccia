@@ -17,13 +17,15 @@ COUNTRIES = {
     "US": "Stati Uniti",
 }
 
-# This is a deliberately small, cited starter catalog. Add products only after
-# checking the product page, producer/origin, parent company, and signal lists.
+# This is a small, cited starter catalog. Suggestions are alternatives by
+# product category, never a certification that a producer has no Israel ties.
 ALTERNATIVES = [
     {
         "target_aliases": {
             "coca cola", "coca cola company", "the coca cola company",
             "coca cola co", "coca cola company inc",
+            "coca cola hbc", "coca cola hbc ag", "coca cola europacific partners",
+            "coca cola consolidated", "coca cola bottling company",
         },
         "country_code": "IT",
         "brand": "Tomarchio",
@@ -43,8 +45,34 @@ ALTERNATIVES = [
         "product": "Classica",
         "origin": "Italia · Torino / produzione e imbottigliamento in Italia",
         "description": "Il produttore presenta Molecola Classica come cola italiana e dichiara produzione e imbottigliamento in Italia.",
-        "product_url": "https://molecolaitalia.it/",
-        "source_label": "Sito ufficiale Molecola",
+        "product_url": "https://molecolaitalia.it/molecola-classica/",
+        "source_label": "Scheda ufficiale Molecola Classica",
+    },
+    {
+        "target_aliases": {
+            "ferrero", "ferrero group", "ferrero international",
+            "ferrero international s a", "ferrero s p a",
+        },
+        "country_code": "IT",
+        "brand": "Novi",
+        "product": "Cioccolato Novi",
+        "origin": "Italia · Novi Ligure / Genova",
+        "description": "Il gruppo Elah Dufour Novi indica Novi tra i propri marchi di cioccolato e dichiara che i suoi stabilimenti sono in Italia.",
+        "product_url": "https://www.elah-dufour.it/il-gruppo",
+        "source_label": "Profilo ufficiale Elah Dufour Novi",
+    },
+    {
+        "target_aliases": {
+            "ferrero", "ferrero group", "ferrero international",
+            "ferrero international s a", "ferrero s p a",
+        },
+        "country_code": "IT",
+        "brand": "Venchi",
+        "product": "Tavoletta Mandorlata Fondente",
+        "origin": "Italia · azienda fondata a Torino",
+        "description": "Alternativa nella categoria cioccolato; il produttore documenta il prodotto e la propria storia italiana.",
+        "product_url": "https://it.venchi.com/products/tavoletta-mandorlata-cioccolato-fondente",
+        "source_label": "Prodotto ufficiale Venchi",
     },
 ]
 
@@ -112,7 +140,7 @@ def get_alternatives(company: str, country_code: str) -> dict:
             "product_url": item["product_url"],
             "source_label": item["source_label"],
             "screening_status": (
-                "Nessuna segnalazione trovata nelle due liste consultate; legami non esclusi."
+                "Nessuna segnalazione trovata nelle liste consultate; questo non esclude altri legami."
                 if both_lists_checked else
                 "Screening delle liste incompleto; legami non verificati."
             ),
@@ -133,7 +161,7 @@ def get_alternatives(company: str, country_code: str) -> dict:
         "items": items,
         "excluded_count": excluded_count,
         "catalog_note": (
-            "Le fonti primarie citate confermano prodotto e provenienza dichiarata, non l’assenza di rapporti con Israele. "
-            "La ricerca nelle liste è un controllo limitato: controlla le fonti e i legami societari aggiornati."
+            "Le fonti ufficiali documentano prodotto e provenienza dichiarata, non l’assenza di rapporti con Israele. "
+            "Il controllo delle liste è limitato e non equivale a una verifica completa dei legami societari."
         ),
     }
